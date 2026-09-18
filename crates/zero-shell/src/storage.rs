@@ -133,8 +133,29 @@ pub fn load_bookmarks() -> Vec<Bookmark> {
     profile_dir().map(|dir| read_bookmarks(&dir)).unwrap_or_default()
 }
 
+thread_local! {
+    /// Saved addresses, once they have been read.
+    ///
+    /// The toolbar asks whether this page is bookmarked while drawing every
+    /// frame, and the answer lives in an encrypted file — so without this, every
+    /// redraw read and decrypted the whole bookmark list to light one star.
+    static SAVED: std::cell::RefCell<Option<std::collections::HashSet<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Forget the cached list, so the next question reads it again. Called wherever
+/// bookmarks change.
+fn forget_bookmarks() {
+    SAVED.with(|saved| *saved.borrow_mut() = None);
+}
+
 pub fn is_bookmarked(url: &str) -> bool {
-    load_bookmarks().iter().any(|b| b.url == url)
+    SAVED.with(|saved| {
+        let mut saved = saved.borrow_mut();
+        saved
+            .get_or_insert_with(|| load_bookmarks().into_iter().map(|b| b.url).collect())
+            .contains(url)
+    })
 }
 
 fn read_bookmarks(dir: &Path) -> Vec<Bookmark> {
@@ -150,6 +171,9 @@ fn read_bookmarks(dir: &Path) -> Vec<Bookmark> {
 fn write_bookmarks(dir: &Path, marks: &[Bookmark]) {
     let text: String = marks.iter().map(|b| format!("{}\t{}\n", b.url, b.title)).collect();
     crate::crypto::write_file(&dir.join("bookmarks.tsv"), &text);
+    // Every change to the list goes through here, so this is the one place that
+    // has to tell the toolbar's cache it is out of date.
+    forget_bookmarks();
 }
 
 /// A saved page, listed by `zero://downloads`.

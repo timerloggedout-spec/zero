@@ -24,6 +24,11 @@ aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "al
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_System_SystemServices",
 ] }
+
+# Only Windows has an icon resource to compile; nothing else needs the crate.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.31"

@@ -461,14 +461,27 @@ fn error_page(target: &str, why: &str) -> String {
     use crate::app::theme;
     let escape = |text: &str| text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     format!(
-        "<html><head><style>         body{{background:{canvas};color:{text};padding:64px;font-size:15px;}}         h1{{color:{text};font-size:26px;padding:6px;}}         .why{{background:{surface};padding:20px;border-radius:10px;color:{text};}}         .url{{color:{faint};padding:10px;}}         .hint{{color:{muted};padding:10px;}}         </style></head><body>         <h1>This page did not load</h1>         <div class=\"why\">Zero tried to reach it, but {}.</div>         <div class=\"url\">{}</div>         <div class=\"hint\">Check the address, or press the reload button to try again.</div>         </body></html>",
+        "<html><head><style>\
+         body{{background:{canvas};color:{text};font-size:14.5px;\
+              padding-left:56px;padding-right:56px;padding-top:44px;}}\
+         h1{{color:{text};font-size:32px;letter-spacing:-0.02em;padding-bottom:6px;}}\
+         .why{{color:{muted};font-size:15px;padding-bottom:26px;}}\
+         .url{{color:{text};background:{chrome};border-radius:10px;\
+              padding-left:18px;padding-right:18px;padding-top:14px;padding-bottom:14px;}}\
+         .hint{{color:{faint};font-size:13px;padding-top:18px;}}\
+         </style></head><body>\
+         <h1>This page did not load</h1>\
+         <div class=\"why\">Zero tried to reach it, but {}.</div>\
+         <div class=\"url\">{}</div>\
+         <div class=\"hint\">Check the address, or reload to try again.</div>\
+         </body></html>",
         escape(why),
         escape(target),
-        canvas = theme::CANVAS,
-        surface = theme::SURFACE,
-        text = theme::TEXT,
-        muted = theme::MUTED,
-        faint = theme::FAINT,
+        canvas = theme::canvas(),
+        chrome = theme::chrome(),
+        text = theme::text(),
+        muted = theme::muted(),
+        faint = theme::faint(),
     )
 }
 

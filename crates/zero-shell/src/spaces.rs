@@ -18,18 +18,40 @@ use std::path::PathBuf;
 pub const DEFAULT: &str = "personal";
 
 /// Accents a space can take, in the order new spaces are offered them. The
-/// first is Zero's own red, which the default space keeps.
+/// first is the blue of the logo's own ring, which the default space keeps.
 const ACCENTS: &[&str] = &[
+    "#559ff3", // the ring's light
     "#e5484d", // red
-    "#3e63dd", // indigo
     "#30a46c", // green
     "#f5a524", // amber
     "#8e4ec6", // violet
     "#0d9488", // teal
 ];
 
+thread_local! {
+    /// The current space, once it has been read.
+    ///
+    /// Which space you are in decides the accent colour, so this is asked for
+    /// several times while building a single frame — and it lives in a file.
+    /// Reading it every time put a handful of disk reads in the path of every
+    /// redraw, which is a strange price for a name that changes when you say so.
+    static IN_USE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The name of the space in use.
 pub fn current() -> String {
+    IN_USE.with(|cached| {
+        if let Some(name) = cached.borrow().as_ref() {
+            return name.clone();
+        }
+        let name = read_current();
+        *cached.borrow_mut() = Some(name.clone());
+        name
+    })
+}
+
+fn read_current() -> String {
     let Some(path) = marker() else { return DEFAULT.to_string() };
     match std::fs::read_to_string(path) {
         Ok(name) => match sanitize(&name) {
@@ -46,6 +68,7 @@ pub fn switch(name: &str) -> Option<String> {
     let name = sanitize(name)?;
     let path = marker()?;
     std::fs::write(path, &name).ok()?;
+    IN_USE.with(|cached| *cached.borrow_mut() = Some(name.clone()));
     // Creating the directory here means `list` sees the new space immediately,
     // even before anything has been saved in it.
     if let Some(dir) = dir_of(&name) {
@@ -132,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn each_space_gets_a_stable_accent_and_the_default_keeps_reds() {
+    fn each_space_gets_a_stable_accent_and_the_default_keeps_the_rings_blue() {
         assert_eq!(accent_of(DEFAULT), ACCENTS[0]);
         assert_eq!(accent_of("work"), accent_of("work"));
         // No other space takes the default's colour, or the two would be

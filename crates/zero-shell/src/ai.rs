@@ -30,12 +30,21 @@ pub trait Assistant {
     fn provenance(&self) -> &'static str;
 }
 
+/// The report's own section labels. Named here so the panel can style them and
+/// the plain-text `--ai` output can print them without either one guessing.
+pub const SECTIONS: &[&str] = &["Summary", "On this page", "Outline"];
+
+/// Is this line one of the report's section labels?
+pub fn is_section(line: &str) -> bool {
+    SECTIONS.contains(&line.trim())
+}
+
 /// Runs entirely on-device. No network, ever.
 pub struct LocalAssistant;
 
 impl Assistant for LocalAssistant {
     fn provenance(&self) -> &'static str {
-        "On-device - nothing left your machine"
+        "Read on this device. Nothing was sent anywhere."
     }
 
     fn respond(&self, ctx: &PageContext) -> String {
@@ -47,19 +56,24 @@ impl Assistant for LocalAssistant {
         let minutes = (words as f32 / 200.0).ceil().max(1.0) as usize;
 
         let mut report = String::new();
-        report.push_str("SUMMARY\n");
+        report.push_str("Summary\n");
         report.push_str(&summarize(&ctx.text, 3));
-        report.push_str("\n\nPAGE\n");
+        report.push_str("\n\nOn this page\n");
         if !ctx.url.is_empty() {
             report.push_str(&format!("{}\n", ctx.url));
         }
-        report.push_str(&format!("{words} words - about {minutes} min read\n"));
-        report.push_str(if ctx.secure { "Connection: encrypted\n" } else { "Connection: NOT secure\n" });
+        report.push_str(&format!("{words} words, about {minutes} min to read\n"));
+        report.push_str(match ctx.secure {
+            true => "The connection is encrypted
+",
+            false => "The connection is not encrypted
+",
+        });
         if ctx.blocked_trackers > 0 {
             report.push_str(&format!("Blocked {} tracker requests\n", ctx.blocked_trackers));
         }
         if !ctx.headings.is_empty() {
-            report.push_str("\nOUTLINE\n");
+            report.push_str("\nOutline\n");
             for (level, text) in ctx.headings.iter().take(8) {
                 let indent = "  ".repeat((*level).saturating_sub(1) as usize);
                 report.push_str(&format!("{indent}{text}\n"));

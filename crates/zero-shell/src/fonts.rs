@@ -14,7 +14,11 @@ fn load_system_fonts() -> Vec<Vec<u8>> {
         // Windows
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/seguisym.ttf", // arrows, stars and other UI symbols
-        "C:/Windows/Fonts/Nirmala.ttf", // Devanagari/Tamil/Telugu/Bengali/...
+        // Devanagari/Tamil/Telugu/Bengali/… Windows ships this as a collection;
+        // the loose `.ttf` only exists on some installs, and looking for it
+        // alone is why Hindi came out as empty boxes on the ones it does not.
+        "C:/Windows/Fonts/Nirmala.ttc",
+        "C:/Windows/Fonts/Nirmala.ttf",
         "C:/Windows/Fonts/msyh.ttc",    // Simplified Chinese
         "C:/Windows/Fonts/msjh.ttc",    // Traditional Chinese
         "C:/Windows/Fonts/YuGothR.ttc", // Japanese
@@ -36,9 +40,16 @@ fn load_system_fonts() -> Vec<Vec<u8>> {
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
     ];
-    // ponytail: every candidate is read into memory at startup, and CJK fonts
-    // are tens of megabytes. Mapping them lazily (or on first miss) is the fix
-    // if footprint starts to matter.
+    // Every candidate is read here, and the CJK ones are tens of megabytes —
+    // but reading all of them costs about 30ms, while *parsing* them costs over
+    // a second, so the engine parses each one only when a page first needs it.
+    //
+    // The reads stay eager on purpose: a renderer is meant to be able to close
+    // the filesystem behind itself once it has its fonts (see `renderer::serve`),
+    // which it could not do if a font might still be needed from disk later.
+    //
+    // ponytail: the bytes of a font that is never used stay in memory. Memory
+    // mapping them is the fix if footprint starts to matter more than the jail.
     CANDIDATES.iter().filter_map(|p| fs::read(p).ok()).collect()
 }
 

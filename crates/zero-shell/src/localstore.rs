@@ -74,3 +74,16 @@ impl zero_engine::KeyValueStore for SiteStore {
         self.flush();
     }
 }
+
+/// A store that keeps nothing, for a renderer that has not been given a page
+/// yet: no site means no site's storage. Replaced the moment one is loaded.
+pub struct NullStore;
+
+impl zero_engine::KeyValueStore for NullStore {
+    fn get(&self, _key: &str) -> Option<String> {
+        None
+    }
+    fn set(&self, _key: &str, _value: &str) {}
+    fn remove(&self, _key: &str) {}
+    fn clear(&self) {}
+}

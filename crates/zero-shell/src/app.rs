@@ -58,7 +58,16 @@ const SCROLLBAR_W: u32 = 12;
 /// size is known — `render_pane` asks again at the window's actual size on
 /// the next frame regardless, since `cache_w`/`cache_h` start unset.
 const DEFAULT_VIEWPORT: (f32, f32) = (800.0, 600.0);
-const MENU_W: u32 = 252;
+const MENU_W: u32 = 274;
+/// The page lies on the window as a card rather than filling a hole in it: this
+/// much window shows past its right and bottom edges, and its corners are
+/// rounded by [`PAGE_RADIUS`]. Straight from the site, whose `.page` is the same
+/// surface (`web/app/globals.css`).
+const PAGE_GAP: u32 = 8;
+const PAGE_RADIUS: u32 = 12;
+/// Menus and tooltips float over the page, so their corners are cut by the
+/// compositor rather than by the engine — see [`blit_rounded`].
+const POPOVER_RADIUS: u32 = 11;
 /// How much horizontal room one toolbar button takes: glyph box plus padding.
 const BUTTON_SPAN: u32 = 40;
 /// One tab in the horizontal strip, including its close affordance.
@@ -66,69 +75,312 @@ const STRIP_TAB_W: u32 = 176;
 
 /// One palette for the whole browser, so the chrome and the built-in pages are
 /// recognisably the same product. Named rather than repeated hex, so a change
-/// lands everywhere at once. Values follow docs/02-UI-UX-SPEC.md §3.1.
+/// lands everywhere at once. Values follow docs/02-UI-UX-SPEC.md §3.1–3.2 and
+/// the website's own chrome (`web/app/globals.css`), which is the same design.
 pub mod theme {
-    pub const CANVAS: &str = "#0e0f12"; // the deepest layer, behind pages
-    pub const CHROME: &str = "#121317"; // the tab rail
-    pub const BAR: &str = "#16181d"; // toolbar, menus
-    pub const SURFACE: &str = "#1e2027"; // buttons, cards, the address pill
-    pub const HOVER: &str = "#282b34";
-    /// Hairline rules. The engine has one font weight, so structure has to come
-    /// from ruled lines and spacing rather than from bolder type.
-    pub const LINE: &str = "#262931";
-    pub const TEXT: &str = "#e8eaed";
-    pub const MUTED: &str = "#8b919b";
-    pub const FAINT: &str = "#5f646e";
-    /// The mark and the active tab, in the current space's colour — which is
-    /// how you can tell at a glance which profile you are typing into.
+    use crate::settings::Theme;
+
+    /// Every colour the chrome draws with. A second theme is a second set of
+    /// these, not a second set of call sites.
+    pub struct Palette {
+        /// The deepest layer, behind pages.
+        pub canvas: &'static str,
+        /// The tab rail and the toolbar — the window's own surface.
+        pub chrome: &'static str,
+        /// Menus, tooltips and anything else that floats above the window.
+        pub elevated: &'static str,
+        /// Buttons, cards, the address pill.
+        pub surface: &'static str,
+        pub hover: &'static str,
+        /// Hairline rules. The engine has one font weight, so structure has to
+        /// come from ruled lines and spacing rather than from bolder type.
+        pub line: &'static str,
+        pub text: &'static str,
+        pub muted: &'static str,
+        pub faint: &'static str,
+        /// A bookmarked page.
+        pub saved: &'static str,
+        /// A secure connection.
+        pub ok: &'static str,
+        pub link: &'static str,
+        /// The scrollbar thumb, and the hairline between two split panes.
+        pub edge: &'static str,
+    }
+
+    /// Light: the website's palette, which takes its colours from the logo —
+    /// the slate ink of the ring, the white it sits on, and its blue light.
+    static LIGHT: Palette = Palette {
+        canvas: "#ffffff",
+        chrome: "#f3f5f7",
+        elevated: "#ffffff",
+        surface: "#ffffff",
+        hover: "#e7eaee",
+        line: "#e3e7eb",
+        text: "#1a222b",
+        muted: "#5b6570",
+        faint: "#8a939c",
+        saved: "#d08700",
+        ok: "#2a8f5e",
+        link: "#2f7fd8",
+        edge: "#c8cfd6",
+    };
+
+    static DARK: Palette = Palette {
+        canvas: "#0e0f12",
+        chrome: "#121317",
+        elevated: "#16181d",
+        surface: "#1e2027",
+        hover: "#282b34",
+        line: "#262931",
+        text: "#e8eaed",
+        muted: "#8b919b",
+        faint: "#5f646e",
+        saved: "#f5a524",
+        ok: "#30a46c",
+        link: "#66ccff",
+        edge: "#5f636d",
+    };
+
+    /// The palette in force, which the `theme` preference chooses.
+    pub fn palette() -> &'static Palette {
+        match crate::settings::current().theme {
+            Theme::Light => &LIGHT,
+            Theme::Dark => &DARK,
+            Theme::System => match system_prefers_dark() {
+                true => &DARK,
+                false => &LIGHT,
+            },
+        }
+    }
+
+    /// Whether the desktop is set to a dark appearance.
+    ///
+    /// Read once: an app that restyles itself mid-session because the setting
+    /// changed is a nice touch, but reading the registry on every CSS string is
+    /// not the way to get it.
+    fn system_prefers_dark() -> bool {
+        static DARK_DESKTOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *DARK_DESKTOP.get_or_init(crate::settings::desktop_prefers_dark)
+    }
+
+    pub fn canvas() -> &'static str {
+        palette().canvas
+    }
+    pub fn chrome() -> &'static str {
+        palette().chrome
+    }
+    pub fn elevated() -> &'static str {
+        palette().elevated
+    }
+    pub fn surface() -> &'static str {
+        palette().surface
+    }
+    pub fn hover() -> &'static str {
+        palette().hover
+    }
+    pub fn line() -> &'static str {
+        palette().line
+    }
+    pub fn text() -> &'static str {
+        palette().text
+    }
+    pub fn muted() -> &'static str {
+        palette().muted
+    }
+    pub fn faint() -> &'static str {
+        palette().faint
+    }
+    pub fn saved() -> &'static str {
+        palette().saved
+    }
+    pub fn ok() -> &'static str {
+        palette().ok
+    }
+    pub fn link() -> &'static str {
+        palette().link
+    }
+    pub fn edge() -> &'static str {
+        palette().edge
+    }
+
+    /// The active tab and the space dot, in the current space's colour — which
+    /// is how you can tell at a glance which profile you are typing into.
     pub fn accent() -> &'static str {
         crate::spaces::accent_of(&crate::spaces::current())
     }
 
-    /// The accent at roughly 12% over [`CHROME`] — the active tab's wash.
-    /// Mixed rather than listed, so a new accent needs no second constant.
-    pub fn accent_soft() -> String {
-        let mix = |i: usize| {
-            let hex = |text: &str, at: usize| {
-                u8::from_str_radix(&text[at..at + 2], 16).unwrap_or(0) as f32
-            };
-            let (accent, chrome) = (hex(accent(), 1 + i * 2), hex(CHROME, 1 + i * 2));
-            (chrome + (accent - chrome) * 0.12).round() as u8
+    /// `ratio` of `over` blended onto `onto`. Both must be `#rrggbb`.
+    pub fn mix(over: &str, onto: &str, ratio: f32) -> String {
+        let channel = |at: usize| {
+            let hex = |text: &str| u8::from_str_radix(&text[at..at + 2], 16).unwrap_or(0) as f32;
+            (hex(onto) + (hex(over) - hex(onto)) * ratio).round() as u8
         };
-        format!("#{:02x}{:02x}{:02x}", mix(0), mix(1), mix(2))
+        format!("#{:02x}{:02x}{:02x}", channel(1), channel(3), channel(5))
     }
-    pub const SAVED: &str = "#f5a524"; // a bookmarked page
-    pub const OK: &str = "#30a46c"; // a secure connection
-    pub const LINK: &str = "#66ccff";
+
+    /// A colour as a packed pixel, for the parts of the frame that are filled
+    /// directly rather than through the engine.
+    pub fn packed(hex: &str) -> u32 {
+        u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0)
+    }
 }
 
-/// [`theme::CANVAS`] as a packed pixel, for the parts of the frame that are
-/// filled directly rather than through the engine. A test keeps the two equal.
-const CANVAS_RGB: u32 = 0x0e_0f_12;
-
-/// The glyphs the chrome draws with. Kept in one place because each one has to
-/// exist somewhere in the font chain — see `fonts::load_system_fonts`.
+/// The icons the chrome draws with: 16px on a 16px grid, a 1.5px stroke, round
+/// geometry — one family, the website's (`web/app/chrome.tsx`).
+///
+/// Each is a function of its colour rather than a constant, because the engine
+/// resolves `currentColor` to black: an icon has to be told what it is. They are
+/// inline `<svg>`, so the browser's own buttons go through the same SVG
+/// rasterizer a page's icons do — if these look wrong, so does the web.
 pub mod icon {
-    pub const BACK: &str = "\u{2190}"; // ←
-    pub const FORWARD: &str = "\u{2192}"; // →
-    pub const RELOAD: &str = "\u{21bb}"; // ↻
-    pub const STAR_EMPTY: &str = "\u{2606}"; // ☆
-    pub const STAR_FULL: &str = "\u{2605}"; // ★
-    pub const BOOKMARKS: &str = "\u{25a4}"; // ▤
-    pub const FIND: &str = "\u{2315}"; // ⌕
-    pub const CLOSE: &str = "\u{00d7}"; // ×
-    pub const ADD: &str = "\u{ff0b}"; // ＋
-    pub const MINUS: &str = "\u{2212}"; // −
-    pub const SECURE: &str = "\u{1f512}"; // 🔒
-    pub const INSECURE: &str = "\u{26a0}"; // ⚠
-    pub const SHIELD: &str = "\u{25c6}"; // ◆
-    pub const MENU: &str = "\u{22ee}"; // ⋮
-    pub const COLLAPSE: &str = "\u{00ab}"; // «
-    pub const EXPAND: &str = "\u{00bb}"; // »
-    pub const SETTINGS: &str = "\u{2699}"; // ⚙
-    pub const DOWNLOAD: &str = "\u{2193}"; // ↓
-    pub const PINNED: &str = "\u{25cf}"; // ●
-    pub const ASSISTANT: &str = "\u{25c7}"; // ◇
+    /// The icon size everything here is drawn at.
+    pub const SIZE: u32 = 16;
+
+    /// Geometry in, icon out. `fill:none` and the stroke are stated once on the
+    /// root, the way an icon set states them.
+    fn drawn(color: &str, size: u32, body: &str) -> String {
+        format!(
+            "<svg width='{size}' height='{size}' viewBox='0 0 16 16' fill='none' \
+             stroke='{color}' stroke-width='1.5'>{body}</svg>"
+        )
+    }
+
+    fn line(color: &str, body: &str) -> String {
+        drawn(color, SIZE, body)
+    }
+
+    pub fn back(color: &str) -> String {
+        line(color, "<path d='M10 3 5 8l5 5'/>")
+    }
+    pub fn forward(color: &str) -> String {
+        line(color, "<path d='m6 3 5 5-5 5'/>")
+    }
+    pub fn reload(color: &str) -> String {
+        line(color, "<path d='M13 8a5 5 0 1 1-1.46-3.54M13.25 2.25v3h-3'/>")
+    }
+    pub fn star(color: &str, filled: bool) -> String {
+        let fill = if filled { color } else { "none" };
+        drawn(
+            color,
+            SIZE,
+            &format!(
+                "<path fill='{fill}' d='M8 2.4 9.73 5.9l3.87.56-2.8 2.73.66 3.85L8 11.23 \
+                 4.54 13.04l.66-3.85-2.8-2.73L6.27 5.9z'/>"
+            ),
+        )
+    }
+    /// A page with a corner turned — bookmarks, and the documents they are.
+    pub fn bookmarks(color: &str) -> String {
+        line(
+            color,
+            "<path d='M4 1.75h5.5L12.25 4.5v9.75H4z'/>\
+             <path d='M9.25 1.75V4.75h3M6.5 8h3.5M6.5 10.75h3.5'/>",
+        )
+    }
+    pub fn history(color: &str) -> String {
+        line(
+            color,
+            "<circle cx='8' cy='8' r='5.75'/><path d='M8 4.75V8.25l2.4 1.4'/>",
+        )
+    }
+    pub fn find(color: &str) -> String {
+        line(color, "<circle cx='7.2' cy='7.2' r='4.45'/><path d='M10.6 10.6 13.6 13.6'/>")
+    }
+    pub fn close(color: &str, size: u32) -> String {
+        drawn(color, size, "<path d='m4.75 4.75 6.5 6.5m0-6.5-6.5 6.5'/>")
+    }
+    pub fn add(color: &str) -> String {
+        line(color, "<path d='M8 3.25v9.5M3.25 8h9.5'/>")
+    }
+    pub fn minus(color: &str) -> String {
+        line(color, "<path d='M3.25 8h9.5'/>")
+    }
+    /// A closed padlock — the one claim the address bar makes.
+    pub fn secure(color: &str) -> String {
+        line(
+            color,
+            "<rect x='3.25' y='7' width='9.5' height='6.75' rx='1.75'/>\
+             <path d='M5.6 7V5.1a2.4 2.4 0 0 1 4.8 0V7'/>",
+        )
+    }
+    pub fn insecure(color: &str) -> String {
+        line(color, "<path d='M8 2.6 14 13.2H2z'/><path d='M8 6.6v2.9'/><path d='M8 11.4v.1'/>")
+    }
+    /// The shield the site marks a clean page with.
+    pub fn shield(color: &str) -> String {
+        line(color, "<path d='M8 1.8 13 3.6v4.1c0 3-2.1 5.4-5 6.5-2.9-1.1-5-3.5-5-6.5V3.6z'/>")
+    }
+    /// The assistant's speech bubble.
+    pub fn assistant(color: &str) -> String {
+        line(
+            color,
+            "<path d='M3 3.5h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7.5L4.5 14v-2.5H3a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1z'/>",
+        )
+    }
+    pub fn menu(color: &str) -> String {
+        drawn(
+            color,
+            SIZE,
+            &format!(
+                "<circle fill='{color}' stroke='none' cx='8' cy='3.4' r='1.15'/>\
+                 <circle fill='{color}' stroke='none' cx='8' cy='8' r='1.15'/>\
+                 <circle fill='{color}' stroke='none' cx='8' cy='12.6' r='1.15'/>"
+            ),
+        )
+    }
+    /// The rail control: the rail itself, with the way it will move next.
+    pub fn rail(color: &str, expanding: bool) -> String {
+        let chevron = match expanding {
+            true => "<path d='m8.4 6.2 1.8 1.8-1.8 1.8'/>",
+            false => "<path d='M10.2 6.2 8.4 8l1.8 1.8'/>",
+        };
+        line(color, &format!("<rect x='2' y='3' width='12' height='10' rx='2'/>{chevron}"))
+    }
+    /// Settings as two sliders rather than a gear: a gear at 16px with a 1.5px
+    /// stroke is a smudge, and this says the same thing.
+    pub fn settings(color: &str) -> String {
+        line(
+            color,
+            "<path d='M2.5 5.5h11M2.5 10.5h11'/>\
+             <circle fill='none' cx='6' cy='5.5' r='1.8'/><circle fill='none' cx='10.5' cy='10.5' r='1.8'/>",
+        )
+    }
+    pub fn download(color: &str) -> String {
+        line(color, "<path d='M8 2.5v7.75M4.9 7.4 8 10.5l3.1-3.1M3 13.25h10'/>")
+    }
+    /// A pinned tab's dot, small enough to sit inside a line of text.
+    pub fn pinned(color: &str) -> String {
+        drawn(color, 8, &format!("<circle fill='{color}' stroke='none' cx='8' cy='8' r='4'/>"))
+    }
+    /// The space's dot in the rail's footer.
+    pub fn dot(color: &str, size: u32) -> String {
+        drawn(color, size, &format!("<circle fill='{color}' stroke='none' cx='8' cy='8' r='4.5'/>"))
+    }
+
+    /// The mark: a ring with a gap near one o'clock, and the blue light where
+    /// its stroke ends.
+    ///
+    /// The website draws the light as a gradient. The engine has no gradients in
+    /// SVG, so it is three arcs stepping from pale to full blue — at the sizes a
+    /// browser draws a logo, the step is the fade.
+    pub fn ring(color: &str, size: u32) -> String {
+        // 324° of the circle from -58°, which is the site's dash, ending at the
+        // gap. The light is painted back along the last 57° from that end, so it
+        // reads as the stroke running out rather than as a mark of its own — and
+        // its far end blends into the ring, standing in for the fade to nothing.
+        let tail = crate::app::theme::mix("#559ff3", color, 0.45);
+        let light = [
+            ("#b9d8fb", "M47.4 12.1A38 38 0 0 0 35.2 15"),
+            ("#559ff3", "M35.2 15A38 38 0 0 0 24.6 21.8"),
+            (tail.as_str(), "M24.6 21.8A38 38 0 0 0 17.1 31"),
+        ]
+        .iter()
+        .map(|(shade, arc)| format!("<path stroke='{shade}' d='{arc}'/>"))
+        .collect::<String>();
+        format!(
+            "<svg width='{size}' height='{size}' viewBox='0 0 100 100' fill='none'              stroke='{color}' stroke-width='17'>             <path d='M70.1 17.8A38 38 0 1 1 47.4 12.1'/>{light}</svg>"
+        )
+    }
 }
 
 /// What each control says when the cursor rests on it: the action, then the key
@@ -147,6 +399,8 @@ pub const TIPS: &[(&str, &str)] = &[
     ("search", "Search your tabs  ·  Ctrl+Shift+A"),
     ("shield", "Trackers blocked here"),
     ("zoom", "Page zoom  ·  Ctrl+0 to reset"),
+    ("go:bookmarks", "Bookmarks  ·  Ctrl+B"),
+    ("go:history", "History  ·  Ctrl+H"),
     ("go:settings", "Settings  ·  Ctrl+,"),
     ("go:downloads", "Downloads  ·  Ctrl+J"),
 ];
@@ -310,7 +564,10 @@ impl Regions {
             false => 0,
         };
         let content_y = (strip_h + TOOLBAR_H).min(height);
-        let full_w = width.saturating_sub(rail_w + ai_w).max(1);
+        // The card's own margin comes off the content area, so everything that
+        // reads a region — clicks, scrolling, layout width — already knows the
+        // page is smaller than the space below the toolbar.
+        let full_w = width.saturating_sub(rail_w + ai_w + PAGE_GAP).max(1);
         // The divider is drawn in the gap, so each pane keeps its own edges.
         let (left_w, right_x, right_w) = match full_w.checked_sub(DIVIDER_W) {
             Some(usable) if split.is_some() && usable > 2 => {
@@ -328,7 +585,7 @@ impl Regions {
             content_x: if focused_right { right_x } else { rail_w },
             content_y,
             content_w: if focused_right { right_w } else { left_w },
-            content_h: height.saturating_sub(content_y).max(1),
+            content_h: height.saturating_sub(content_y + PAGE_GAP).max(1),
             other_x: if focused_right { rail_w } else { right_x },
             other_w: if focused_right { left_w } else { right_w },
             width,
@@ -542,6 +799,21 @@ struct Tab {
 
 /// A tab's own `localStorage`, partitioned by site like cookies — shared by
 /// [`Tab::new`] and [`App::load`], the two places a renderer is spawned.
+/// Whether a navigation can stay in the renderer process it is already in.
+///
+/// Only between the browser's own screens. Every preference is a link, so a
+/// settings toggle is a navigation — and killing a renderer to start another
+/// one, which then reads the whole font chain again, is a great deal of
+/// machinery to move a radio button. Two `zero://` pages are both ours and
+/// trust each other by definition.
+///
+/// Anything involving the web gets its own process, including one web page
+/// following another: a fresh process per navigation is the isolation this
+/// browser has, and it is not being spent to save milliseconds.
+fn can_share_a_renderer(from: &str, to: &str) -> bool {
+    crate::internal::is_internal(from) && crate::internal::is_internal(to)
+}
+
 fn store_for(address: &str) -> Rc<dyn zero_engine::KeyValueStore> {
     Rc::new(crate::localstore::SiteStore::for_site(&storage_site(address)))
 }
@@ -682,6 +954,12 @@ pub fn screenshot(
             ("hover", id) => app.hovered = Some(id.to_string()),
             ("railpx", _) => {} // applied after the loop, once settings are known
             ("search", query) => app.focus = Focus::TabSearch(query.to_string()),
+            ("find", query) => {
+                // Run the search rather than only opening the bar, so the shot
+                // shows a real match count instead of an empty field.
+                app.focus = Focus::Find(query.to_string());
+                app.apply_chrome_field();
+            }
             ("split", _) => app.toggle_split(),
             ("space", name) => app.switch_space(name),
             ("tabs", n) => {
@@ -827,6 +1105,8 @@ impl App {
     fn run(mut self) {
         let event_loop = EventLoop::new().expect("failed to create event loop");
         event_loop.run_app(&mut self).expect("event loop error");
+        // The spare renderer belongs to the window, not to the process.
+        renderer::drop_warm();
     }
 }
 
@@ -834,6 +1114,7 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title("Zero Browser")
+            .with_window_icon(window_icon())
             .with_inner_size(LogicalSize::new(1180.0, 760.0));
         let window = Rc::new(event_loop.create_window(attrs).expect("failed to create window"));
         // Devanagari, Tamil and CJK are typed through an input method, which
@@ -845,6 +1126,9 @@ impl ApplicationHandler for App {
         window.request_redraw();
         self.window = Some(window);
         self.surface = Some(surface);
+        // Get a renderer ready while the first frame is being drawn, so the
+        // first Ctrl+T does not pay for one.
+        renderer::warm();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -914,6 +1198,26 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+}
+
+/// The mark, for the taskbar and the window's own corner.
+///
+/// Rasterized from the same ring the chrome draws rather than loaded from a
+/// file: there is then one logo in the codebase, and it cannot fall out of step
+/// with itself. `None` costs the icon, never the window.
+fn window_icon() -> Option<winit::window::Icon> {
+    const SIZE: u32 = 64;
+    // The taskbar is the desktop's surface, not ours: an ink ring on a dark
+    // taskbar is an invisible ring, whichever theme the browser itself is in.
+    let ring = match crate::settings::desktop_prefers_dark() {
+        true => "#e8eaed",
+        false => "#1a222b",
+    };
+    let source = icon::ring(ring, SIZE);
+    let drawn = zero_engine::svg::rasterize(&source, SIZE as usize, SIZE as usize)?;
+    let rgba: Vec<u8> =
+        drawn.pixels.iter().flat_map(|p| [p.r, p.g, p.b, p.a]).collect();
+    winit::window::Icon::from_rgba(rgba, SIZE, SIZE).ok()
 }
 
 impl App {
@@ -1415,6 +1719,26 @@ impl App {
             .filter(|r| px >= r.x && px <= r.x + r.width && py >= r.y && py <= r.y + r.height)
             .map(|r| r.node_id)
             .next_back();
+        let href = self
+            .tab()
+            .links
+            .iter()
+            .find(|l| px >= l.x && px <= l.x + l.width && py >= l.y && py <= l.y + l.height)
+            .map(|l| l.href.clone());
+        // A link on one of the browser's own screens can be followed straight
+        // away. Those pages run no scripts, so nothing there can intercept a
+        // click — and asking the renderer first would draw the whole page again
+        // only to find that out, then draw the page being navigated to as well.
+        // Every preference is a link, so this is the whole cost of a settings
+        // toggle. Anything from the web is still asked first.
+        if let Some(href) = href.clone() {
+            if crate::internal::is_internal(&self.tab().address) {
+                let target = resolve_url(&self.tab().address, &href);
+                self.go_to(target);
+                self.request_redraw();
+                return;
+            }
+        }
         // Sent even when nothing was hit: `click` always blurs first —
         // clicking the page clears focus unless the click lands on a field —
         // which is why this always reaches the renderer rather than being
@@ -1430,12 +1754,6 @@ impl App {
             return;
         }
 
-        let href = self
-            .tab()
-            .links
-            .iter()
-            .find(|l| px >= l.x && px <= l.x + l.width && py >= l.y && py <= l.y + l.height)
-            .map(|l| l.href.clone());
         if let Some(href) = href {
             let target = resolve_url(&self.tab().address, &href);
             self.go_to(target);
@@ -1582,22 +1900,36 @@ impl App {
             }
         };
         let tab = self.tab_mut();
+        let stay = can_share_a_renderer(&tab.address, &fetched.url) && !tab.renderer.is_dead();
         // An HTTPS upgrade can change the URL, so adopt whatever actually loaded.
         tab.address = fetched.url;
         tab.secure = fetched.secure;
         // A new page means a new document and a fresh JS runtime. The loader goes
         // in so page scripts can fetch relative to this URL.
         tab.loader = Rc::new(ShellLoader::new(tab.address.clone()));
-        let (renderer, frame) = TabRenderer::spawn(
-            &fetched.body,
-            "",
-            w,
-            h,
-            tab.loader.clone(),
-            store_for(&tab.address),
-        )
-        .expect("spawn the tab's renderer process");
-        tab.renderer = renderer; // dropping the old one kills its process
+        let frame = match stay {
+            true => tab.renderer.replace_page(
+                &fetched.body,
+                "",
+                w,
+                h,
+                tab.loader.clone(),
+                store_for(&tab.address),
+            ),
+            false => TabRenderer::spawn(
+                &fetched.body,
+                "",
+                w,
+                h,
+                tab.loader.clone(),
+                store_for(&tab.address),
+            )
+            .map(|(renderer, frame)| {
+                tab.renderer = renderer; // dropping the old one kills its process
+                frame
+            }),
+        }
+        .expect("the tab's renderer could not draw the page");
         tab.source = fetched.body;
         tab.matches.clear();
         tab.scroll_y = 0.0;
@@ -1655,14 +1987,20 @@ impl App {
         let Some((text, headings)) = self.tab_mut().renderer.page_text() else { return };
         let ctx = PageContext { url, text, headings, blocked_trackers, secure };
         let assistant = LocalAssistant;
-        self.ai_text = format!("{}\n\n[{}]", assistant.respond(&ctx), assistant.provenance());
+        // The provenance is a plain sentence, not an aside in brackets: where
+        // the summary came from is the most reassuring thing on the panel.
+        self.ai_text = format!("{}\n\n{}", assistant.respond(&ctx), assistant.provenance());
     }
 
     fn ai_html(&self) -> String {
         let body: String = self
             .ai_text
             .lines()
-            .map(|line| format!("<div class=\"line\">{}</div>", escape(line)))
+            .map(|line| {
+                // A section label reads as one, rather than as another sentence.
+                let class = if crate::ai::is_section(line) { "sec" } else { "line" };
+                format!("<div class=\"{class}\">{}</div>", escape(line))
+            })
             .collect();
         format!("<html><body><div id=\"head\">Assistant</div>{body}</body></html>")
     }
@@ -1850,6 +2188,22 @@ impl App {
         }
     }
 
+    /// A control's icon colour. Under the cursor it brightens to the text
+    /// colour, which is the whole of the hover state on a control whose
+    /// background is already doing the other half.
+    fn ink(&self, id: &str, base: &'static str) -> &'static str {
+        match self.hovered.as_deref() == Some(id) {
+            true => theme::text(),
+            false => base,
+        }
+    }
+
+    /// A colour dimmed halfway to the surface behind it: a control that is
+    /// there but cannot be used.
+    fn dim() -> String {
+        theme::mix(theme::faint(), theme::chrome(), 0.45)
+    }
+
     fn toolbar_html(&self, regions: &Regions) -> String {
         let tab = self.tab();
         // With the find bar open it replaces the address, since it owns typing.
@@ -1861,11 +2215,11 @@ impl App {
                 (false, n) => format!("{n} matches — Enter for next, Esc to close"),
             };
             return format!(
-                "<html><body><div id=\"bar\">\
-                 <span class=\"btn\">{}</span>\
-                 <span class=\"addr\">{}| <span class=\"hint\">{hits}</span></span>\
-                 </div></body></html>",
-                icon::FIND,
+                "<html><body><div id=\"bar\"><div class=\"omni\">\
+                 <span class=\"ico\">{}</span>\
+                 <span class=\"addr\">{}|</span>\
+                 <span class=\"hint\">{hits}</span></div></div></body></html>",
+                icon::find(theme::muted()),
                 escape(query)
             );
         }
@@ -1874,12 +2228,19 @@ impl App {
         // at all, so it claims nothing.
         let lock = match (crate::internal::is_internal(&tab.address), tab.secure) {
             (true, _) => String::new(),
-            (false, true) => format!("<span class=\"lock\">{} </span>", icon::SECURE),
-            (false, false) => format!("<span class=\"warn\">{} not secure </span>", icon::INSECURE),
+            (false, true) => format!("<span class=\"ico\">{}</span>", icon::secure(theme::ok())),
+            (false, false) => format!(
+                "<span class=\"ico\">{}</span><span class=\"warn\">not secure</span>",
+                icon::insecure(theme::saved())
+            ),
         };
         let shield = match tab.blocked_count {
             0 => String::new(),
-            n => format!(" <span id=\"shield\" class=\"hint\">{} {n}</span>", icon::SHIELD),
+            n => format!(
+                "<span id=\"shield\" class=\"{}\">{} {n}</span>",
+                self.lit("shield", "chip"),
+                icon::shield(self.ink("shield", theme::muted())),
+            ),
         };
         // A zoom that is not 100% has to be visible, or a page just looks wrong.
         let zoom = match tab.zoom {
@@ -1891,102 +2252,137 @@ impl App {
         let mut left = String::new();
         let mut buttons = 4; // back, forward, reload, menu
         if self.settings.layout == TabLayout::Vertical {
-            let glyph = match self.settings.rail {
-                Rail::Hidden => icon::EXPAND,
-                _ => icon::COLLAPSE,
-            };
             left.push_str(&format!(
-                "<span id=\"rail\" class=\"{}\">{glyph}</span>",
-                self.lit("rail", "btn")
+                "<span id=\"rail\" class=\"{}\">{}</span>",
+                self.lit("rail", "btn"),
+                icon::rail(self.ink("rail", theme::muted()), self.settings.rail == Rail::Hidden),
             ));
             buttons += 1;
         }
         // With no rail on screen there is nowhere else to open a tab from.
-        let hidden_rail = self.settings.layout == TabLayout::Vertical
-            && self.settings.rail == Rail::Hidden;
+        let hidden_rail =
+            self.settings.layout == TabLayout::Vertical && self.settings.rail == Rail::Hidden;
         if hidden_rail {
             left.push_str(&format!(
                 "<span id=\"new\" class=\"{}\">{}</span>",
                 self.lit("new", "btn"),
-                icon::ADD
+                icon::add(self.ink("new", theme::muted())),
             ));
             buttons += 1;
         }
         let bookmarked = storage::is_bookmarked(&tab.address);
-        let mut right = format!(
+        // State is a colour, not a fill: a saved page and an open assistant say
+        // so by lighting their own icon, the way the site marks a current tab.
+        let star_ink = match bookmarked {
+            true => theme::saved(),
+            false => self.ink("star", theme::muted()),
+        };
+        let ai_ink = match self.ai_open {
+            true => theme::accent(),
+            false => self.ink("ai", theme::muted()),
+        };
+        let right = format!(
             "<span id=\"star\" class=\"{}\">{}</span>\
              <span id=\"marks\" class=\"{}\">{}</span>\
-             <span id=\"ai\" class=\"{}\">{}</span>",
-            self.lit("star", if bookmarked { "on" } else { "btn" }),
-            if bookmarked { icon::STAR_FULL } else { icon::STAR_EMPTY },
+             <span id=\"ai\" class=\"{}\">{}</span>\
+             <span id=\"overflow\" class=\"{}\">{}</span>",
+            self.lit("star", "btn"),
+            icon::star(star_ink, bookmarked),
             self.lit("marks", "btn"),
-            icon::BOOKMARKS,
-            self.lit("ai", if self.ai_open { "on" } else { "btn" }),
-            icon::ASSISTANT,
+            icon::bookmarks(self.ink("marks", theme::muted())),
+            self.lit("ai", "btn"),
+            icon::assistant(ai_ink),
+            self.lit("overflow", "btn"),
+            icon::menu(self.ink("overflow", theme::muted())),
         );
         buttons += 3;
-        right.push_str(&format!(
-            "<span id=\"overflow\" class=\"{}\">{}</span>",
-            self.lit("overflow", "btn"),
-            icon::MENU
-        ));
-        let addr_width = regions
+        // Capped as well as fitted: past a point a wider window should give its
+        // room to the page, not stretch one field across the whole screen.
+        let omni_width = regions
             .toolbar_w()
-            .saturating_sub(BUTTON_SPAN * buttons + 44 + if zoom.is_empty() { 0 } else { 52 })
-            .max(80);
+            .saturating_sub(BUTTON_SPAN * buttons + 40 + if zoom.is_empty() { 0 } else { 56 })
+            .clamp(120, 640);
+        // The scheme is dimmed rather than hidden: it is the part of an address
+        // that matters least to read and most to be able to check.
+        let address = match tab.address.split_once("://") {
+            Some((scheme, rest)) => format!(
+                "<span class=\"scheme\">{}://</span>{}",
+                escape(scheme),
+                escape(rest)
+            ),
+            None => escape(&tab.address),
+        };
         let back = self.lit("back", if tab.history_index > 0 { "btn" } else { "off" });
-        let fwd =
-            self.lit("fwd", if tab.history_index + 1 < tab.history.len() { "btn" } else { "off" });
+        let back_ink = match tab.history_index > 0 {
+            true => self.ink("back", theme::muted()).to_string(),
+            false => Self::dim(),
+        };
+        let can_forward = tab.history_index + 1 < tab.history.len();
+        let fwd = self.lit("fwd", if can_forward { "btn" } else { "off" });
+        let fwd_ink = match can_forward {
+            true => self.ink("fwd", theme::muted()).to_string(),
+            false => Self::dim(),
+        };
         format!(
-            "<html><head><style>.addr{{width:{addr_width}px;}}</style></head>\
-             <body><div id=\"bar\">{left}\
+            "<html><head><style>.omni{{width:{omni_width}px;}}</style></head>\
+             <body><div id=\"bar\">\
+             <div class=\"cluster\">{left}\
              <span id=\"back\" class=\"{back}\">{}</span>\
              <span id=\"fwd\" class=\"{fwd}\">{}</span>\
-             <span id=\"reload\" class=\"{}\">{}</span>\
-             <span class=\"addr\">{lock}{}|{shield}</span>{zoom}{right}\
+             <span id=\"reload\" class=\"{}\">{}</span></div>\
+             <div class=\"omni\">{lock}<span class=\"addr\">{address}|</span>{shield}</div>\
+             <div class=\"cluster\">{zoom}{right}</div>\
              </div></body></html>",
-            icon::BACK,
-            icon::FORWARD,
+            icon::back(&back_ink),
+            icon::forward(&fwd_ink),
             self.lit("reload", "btn"),
-            icon::RELOAD,
-            escape(&tab.address),
+            icon::reload(self.ink("reload", theme::muted())),
         )
     }
 
-    /// Toolbar styling. Buttons are a fixed square so their glyphs sit centred
+    /// Toolbar styling. Buttons are a fixed square so their icons sit centred
     /// rather than lopsided; the pill's width is injected per frame because it
     /// depends on how many buttons the current layout draws.
     fn toolbar_css() -> String {
         format!(
-            "body{{background:{bar};color:{text};font-size:14px;}} \
-             #bar{{padding:8px;height:28px;\
-                  border-bottom-width:1px;border-color:{line};}} \
-             .btn{{display:inline-block;background:{surface};color:{text};width:24px;\
-                  padding:6px;border-radius:8px;text-align:center;}} \
-             .off{{display:inline-block;background:{bar};color:{faint};width:24px;\
-                  padding:6px;border-radius:8px;text-align:center;}} \
-             .on{{display:inline-block;background:{surface};color:{saved};width:24px;\
-                 padding:6px;border-radius:8px;text-align:center;}} \
+            "body{{background:{chrome};color:{text};font-size:14px;}} \
+             #bar{{display:flex;align-items:center;justify-content:space-between;\
+                  height:38px;padding:9px;}} \
+             .cluster{{display:flex;align-items:center;gap:2px;}} \
+             .btn{{display:inline-flex;flex-shrink:0;align-items:center;justify-content:center;\
+                  width:34px;height:34px;border-radius:9px;}} \
+             .off{{display:inline-flex;flex-shrink:0;align-items:center;justify-content:center;\
+                  width:34px;height:34px;border-radius:9px;}} \
              .hot{{background:{hover};}} \
-             .addr{{display:inline-block;background:{surface};color:{text};padding:7px;\
-                   border-radius:9px;}} \
-             .badge{{display:inline-block;background:{surface};color:{muted};font-size:12px;\
-                    padding:7px;border-radius:8px;}} \
-             .lock{{color:{ok};}} .warn{{color:{saved};}} .hint{{color:{faint};}}",
-            bar = theme::BAR,
-            text = theme::TEXT,
-            surface = theme::SURFACE,
-            hover = theme::HOVER,
-            faint = theme::FAINT,
-            saved = theme::SAVED,
-            muted = theme::MUTED,
-            line = theme::LINE,
-            ok = theme::OK,
+             .omni{{display:flex;align-items:center;height:36px;border-radius:11px;\
+                   background:{surface};border-width:1px;border-color:{line};\
+                   padding-left:4px;padding-right:5px;}} \
+             .addr{{flex-grow:1;padding-left:8px;color:{text};font-size:14.5px;\
+                   white-space:nowrap;}} \
+             .scheme{{color:{faint};}} \
+             .ico{{display:inline-flex;flex-shrink:0;align-items:center;padding-left:7px;}} \
+             .warn{{color:{saved};font-size:13px;padding-left:6px;}} \
+             .chip{{display:inline-flex;flex-shrink:0;align-items:center;height:26px;border-radius:7px;\
+                   background:{chrome};color:{muted};font-size:13px;\
+                   padding-left:8px;padding-right:9px;}} \
+             .badge{{display:inline-flex;flex-shrink:0;align-items:center;height:26px;border-radius:7px;\
+                    background:{surface};border-width:1px;border-color:{line};\
+                    color:{muted};font-size:12px;padding-left:9px;padding-right:9px;\
+                    margin-right:6px;}} \
+             .hint{{color:{faint};font-size:13px;padding-left:10px;padding-right:8px;}}",
+            chrome = theme::chrome(),
+            text = theme::text(),
+            surface = theme::surface(),
+            hover = theme::hover(),
+            faint = theme::faint(),
+            saved = theme::saved(),
+            muted = theme::muted(),
+            line = theme::line(),
         )
     }
 
-    /// The vertical rail: a wordmark, a tab search field, the tabs, and a way to
-    /// open another. Pinned tabs lead.
+    /// The vertical rail: the mark, two pinned destinations, a tab search field,
+    /// the tabs, and a way to open another. Pinned tabs lead.
     fn rail_html(&self, rail_w: u32) -> String {
         let icons = rail_w <= RAIL_ICON_MAX;
         let room = rail_label_room(rail_w);
@@ -2007,50 +2403,65 @@ impl App {
                     );
                 }
                 let pin = match tab.pinned {
-                    true => format!("<span class=\"pin\">{} </span>", icon::PINNED),
+                    true => format!("<span class=\"pin\">{}</span>", icon::pinned(theme::accent())),
                     false => String::new(),
                 };
                 format!(
-                    "<div id=\"tab:{i}\" class=\"{class}\">\
-                     <span class=\"name\">{pin}{}</span>\
+                    "<div id=\"tab:{i}\" class=\"{class}\">{pin}\
+                     <span class=\"name\">{}</span>\
                      <span id=\"close:{i}\" class=\"{}\">{}</span></div>",
                     escape(&tab.label_capped(room)),
                     self.lit(&format!("close:{i}"), "x"),
-                    icon::CLOSE,
+                    icon::close(self.ink(&format!("close:{i}"), theme::faint()), 13),
                 )
             })
             .collect();
         let new = format!(
-            "<div id=\"new\" class=\"{}\">{}{}</div>",
+            "<div id=\"new\" class=\"{}\"><span class=\"plus\">{}</span>{}</div>",
             self.lit("new", "tab new"),
-            icon::ADD,
-            if icons { String::new() } else { "  New tab".to_string() },
+            icon::add(self.ink("new", theme::faint())),
+            if icons { String::new() } else { escape(&t("New tab")) },
         );
         if icons {
+            // Narrow: the mark alone, and a column of initials under it.
             return format!(
-                "<html><body><div id=\"head\">0</div>{rows}{new}</body></html>"
+                "<html><body><div id=\"head\">{}</div>{rows}{new}</body></html>",
+                icon::ring(theme::text(), 20),
             );
         }
         // The search field replaces the header's subtitle while it is open, so the
         // rail never grows a row it did not have a moment ago.
         let search = match &self.focus {
             Focus::TabSearch(query) => format!(
-                "<div id=\"search\" class=\"find on\">{} {}|</div>",
-                icon::FIND,
+                "<div id=\"search\" class=\"find on\"><span class=\"ico\">{}</span>{}|</div>",
+                icon::find(theme::text()),
                 escape(query)
             ),
             _ => format!(
-                "<div id=\"search\" class=\"{}\">{} Search tabs</div>",
+                "<div id=\"search\" class=\"{}\"><span class=\"ico\">{}</span>{}</div>",
                 self.lit("search", "find"),
-                icon::FIND
+                icon::find(self.ink("search", theme::faint())),
+                escape(&t("Search tabs")),
             ),
         };
         let empty = match rows.is_empty() {
-            true => "<div class=\"none\">No tab matches that.</div>",
-            false => "",
+            true => format!("<div class=\"none\">{}</div>", escape(&t("No tab matches that."))),
+            false => String::new(),
         };
+        // Two places worth keeping one click away, as the site's rail does.
+        let pinned = format!(
+            "<div class=\"pinned\">\
+             <span id=\"go:bookmarks\" class=\"{}\">{}</span>\
+             <span id=\"go:history\" class=\"{}\">{}</span></div>",
+            self.lit("go:bookmarks", "quick"),
+            icon::bookmarks(self.ink("go:bookmarks", theme::muted())),
+            self.lit("go:history", "quick"),
+            icon::history(self.ink("go:history", theme::muted())),
+        );
         format!(
-            "<html><body><div id=\"head\">zero</div>{search}{rows}{empty}{new}</body></html>"
+            "<html><body><div id=\"head\">{}<span class=\"word\">zero</span></div>\
+             {pinned}{search}{rows}{empty}{new}</body></html>",
+            icon::ring(theme::text(), 20),
         )
     }
 
@@ -2066,83 +2477,101 @@ impl App {
             false => (12, rail_name_width(rail_w)),
         };
         format!(
-            "body{{background:{chrome};color:{muted};font-size:13px;height:{height}px;\
-                  padding-left:8px;padding-right:8px;}} \
-             #head{{color:{accent};padding-top:14px;padding-bottom:14px;padding-left:{row_pad}px;\
-                   font-size:15px;text-align:{align};}} \
-             .find{{color:{faint};font-size:12px;padding-top:8px;padding-bottom:8px;\
-                   padding-left:{row_pad}px;border-radius:8px;margin-bottom:6px;}} \
+            "body{{background:{chrome};color:{muted};font-size:14.5px;height:{height}px;\
+                  padding-left:12px;padding-right:10px;padding-top:16px;}} \
+             #head{{display:flex;align-items:center;padding-left:{head_pad}px;\
+                   padding-bottom:18px;justify-content:{align};}} \
+             .word{{color:{text};font-size:22px;letter-spacing:-0.03em;padding-left:9px;}} \
+             .pinned{{display:flex;gap:6px;padding-bottom:16px;}} \
+             .quick{{display:inline-flex;flex-shrink:0;flex-grow:1;align-items:center;justify-content:center;\
+                    height:38px;border-radius:10px;background:{quiet};}} \
+             .find{{display:flex;align-items:center;color:{faint};font-size:13px;\
+                   height:34px;padding-left:{row_pad}px;border-radius:10px;margin-bottom:8px;}} \
+             .ico{{display:inline-flex;flex-shrink:0;align-items:center;padding-right:9px;}} \
              .on{{background:{surface};color:{text};}} \
-             .tab{{padding-top:9px;padding-bottom:9px;padding-left:{row_pad}px;\
-                  padding-right:8px;border-radius:9px;\
-                  border-left-width:3px;border-color:{chrome};text-align:{align};}} \
+             .tab{{display:flex;align-items:center;height:38px;padding-left:{row_pad}px;\
+                  padding-right:8px;border-radius:10px;\
+                  border-left-width:3px;border-color:{chrome};text-align:{text_align};}} \
              .hot{{background:{hover};color:{text};}} \
-             .active{{background:{soft};color:{text};border-left-width:3px;border-color:{accent};}} \
-             .new{{color:{faint};margin-top:4px;}} \
-             .none{{color:{faint};font-size:12px;padding-top:10px;padding-left:{row_pad}px;}} \
-             .pin{{color:{accent};font-size:9px;}} \
-             .name{{display:inline-block;width:{name_w}px;}} \
-             .x{{display:inline-block;width:24px;color:{faint};text-align:right;\
-                border-radius:6px;}}",
-            align = if icons { "center" } else { "left" },
-            chrome = theme::CHROME,
-            surface = theme::SURFACE,
-            soft = theme::accent_soft(),
-            hover = theme::HOVER,
-            text = theme::TEXT,
-            muted = theme::MUTED,
-            faint = theme::FAINT,
+             .active{{background:{surface};color:{text};border-left-width:3px;\
+                     border-color:{accent};}} \
+             .new{{color:{faint};margin-top:2px;}} \
+             .plus{{display:inline-flex;flex-shrink:0;align-items:center;padding-right:9px;}} \
+             .none{{color:{faint};font-size:13px;padding-top:10px;padding-left:{row_pad}px;}} \
+             .pin{{display:inline-flex;flex-shrink:0;align-items:center;padding-right:7px;}} \
+             .name{{display:inline-block;flex-grow:1;width:{name_w}px;white-space:nowrap;}} \
+             .x{{display:inline-flex;flex-shrink:0;align-items:center;justify-content:center;\
+                width:22px;height:22px;border-radius:6px;}}",
+            head_pad = if icons { 0 } else { 8 },
+            align = if icons { "center" } else { "flex-start" },
+            text_align = if icons { "center" } else { "left" },
+            quiet = theme::mix(theme::text(), theme::chrome(), 0.05),
+            chrome = theme::chrome(),
+            surface = theme::surface(),
+            hover = theme::hover(),
+            text = theme::text(),
+            muted = theme::muted(),
+            faint = theme::faint(),
             accent = theme::accent(),
         )
     }
 
-    /// The rail's footer: a permanent home for settings, pinned to the bottom of
-    /// the window by being its own surface rather than by padding arithmetic.
+    /// The rail's footer: which space you are in, and a permanent home for
+    /// settings. Pinned to the bottom of the window by being its own surface
+    /// rather than by padding arithmetic.
     fn rail_foot_html(&self, icons: bool) -> String {
         let settings = format!(
-            "<span id=\"go:settings\" class=\"{}\">{}{}</span>",
+            "<span id=\"go:settings\" class=\"{}\">{}</span>",
             self.lit("go:settings", "foot"),
-            icon::SETTINGS,
-            if icons { String::new() } else { "  Settings".to_string() },
+            icon::settings(self.ink("go:settings", theme::faint())),
         );
-        let downloads = match icons {
-            true => String::new(),
-            false => format!(
-                "<span id=\"go:downloads\" class=\"{}\">{}</span>",
-                self.lit("go:downloads", "foot"),
-                icon::DOWNLOAD
-            ),
-        };
-        format!("<html><body><div id=\"row\">{settings}{downloads}</div></body></html>")
+        if icons {
+            return format!("<html><body><div id=\"row\">{settings}</div></body></html>");
+        }
+        let downloads = format!(
+            "<span id=\"go:downloads\" class=\"{}\">{}</span>",
+            self.lit("go:downloads", "foot"),
+            icon::download(self.ink("go:downloads", theme::faint())),
+        );
+        // The space's name and colour, which is what tells you whose history and
+        // cookies the next click lands in.
+        let space = crate::spaces::current();
+        format!(
+            "<html><body><div id=\"row\">\
+             <span class=\"space\"><span class=\"dot\">{}</span>{}</span>\
+             <span class=\"tools\">{settings}{downloads}</span></div></body></html>",
+            icon::dot(theme::accent(), 8),
+            escape(&space),
+        )
     }
 
     fn rail_foot_css(icons: bool) -> String {
         format!(
             "body{{background:{chrome};color:{muted};font-size:13px;\
-                  padding-left:8px;padding-right:8px;}} \
+                  padding-left:12px;padding-right:10px;}} \
              #row{{display:flex;justify-content:{justify};align-items:center;\
-                  padding-top:10px;border-top-width:1px;border-color:{line};height:24px;}} \
-             .foot{{display:inline-block;color:{faint};padding-top:5px;padding-bottom:5px;\
-                   padding-left:10px;padding-right:10px;border-radius:8px;}} \
+                  padding-top:10px;border-top-width:1px;border-color:{line};height:30px;}} \
+             .space{{display:inline-flex;flex-shrink:0;align-items:center;color:{faint};padding-left:8px;}} \
+             .dot{{display:inline-flex;flex-shrink:0;align-items:center;padding-right:9px;}} \
+             .tools{{display:inline-flex;flex-shrink:0;align-items:center;gap:2px;}} \
+             .foot{{display:inline-flex;flex-shrink:0;align-items:center;justify-content:center;\
+                   width:30px;height:30px;border-radius:8px;}} \
              .hot{{background:{hover};color:{text};}}",
             justify = if icons { "center" } else { "space-between" },
-            chrome = theme::CHROME,
-            hover = theme::HOVER,
-            text = theme::TEXT,
-            muted = theme::MUTED,
-            faint = theme::FAINT,
-            line = theme::LINE,
+            chrome = theme::chrome(),
+            hover = theme::hover(),
+            text = theme::text(),
+            muted = theme::muted(),
+            faint = theme::faint(),
+            line = theme::line(),
         )
     }
 
     /// The horizontal tab strip. Tabs that do not fit are reachable from tab
     /// search and Ctrl+Tab.
-    ///
-    /// ponytail: no scrolling or overflow chevron — the count tells you how many
-    /// are hidden. Add a scroll offset here if people start living past tab 8.
     fn strip_html(&self, regions: &Regions) -> String {
         let order = self.rail_order();
-        let room = (regions.width.saturating_sub(140) / STRIP_TAB_W).max(1) as usize;
+        let room = (regions.width.saturating_sub(150) / STRIP_TAB_W).max(1) as usize;
         let shown = order.len().min(room);
         let tabs: String = order[..shown]
             .iter()
@@ -2153,19 +2582,19 @@ impl App {
                     false => "tab",
                 };
                 let pin = match tab.pinned {
-                    true => format!("<span class=\"pin\">{} </span>", icon::PINNED),
+                    true => format!("<span class=\"pin\">{}</span>", icon::pinned(theme::accent())),
                     false => String::new(),
                 };
                 // A strip tab is narrower than a rail row, so it names itself
                 // more briefly. The tooltip still gives the full title.
                 let room = if tab.pinned { 14 } else { 16 };
                 format!(
-                    "<span id=\"tab:{i}\" class=\"{}\"><span class=\"name\">{pin}{}</span>\
+                    "<span id=\"tab:{i}\" class=\"{}\">{pin}<span class=\"name\">{}</span>\
                      <span id=\"close:{i}\" class=\"{}\">{}</span></span>",
                     self.lit(&format!("tab:{i}"), base),
                     escape(&tab.label_capped(room)),
                     self.lit(&format!("close:{i}"), "x"),
-                    icon::CLOSE,
+                    icon::close(self.ink(&format!("close:{i}"), theme::faint()), 13),
                 )
             })
             .collect();
@@ -2174,46 +2603,47 @@ impl App {
             n => format!("<span class=\"more\">+{n}</span>"),
         };
         format!(
-            "<html><body><div id=\"strip\"><span class=\"mark\">zero</span>{tabs}\
+            "<html><body><div id=\"strip\"><span class=\"mark\">{}</span>{tabs}\
              <span id=\"new\" class=\"{}\">{}</span>{more}\
              <span id=\"rail\" class=\"{}\">{}</span></div></body></html>",
+            icon::ring(theme::text(), 18),
             self.lit("new", "add"),
-            icon::ADD,
+            icon::add(self.ink("new", theme::muted())),
             self.lit("rail", "add"),
-            icon::COLLAPSE,
+            icon::rail(self.ink("rail", theme::muted()), true),
         )
     }
 
     fn strip_css() -> String {
         format!(
             "body{{background:{chrome};color:{muted};font-size:13px;}} \
-             #strip{{padding-left:10px;padding-top:6px;height:26px;\
+             #strip{{display:flex;align-items:center;gap:2px;height:30px;\
+                    padding-left:12px;padding-right:8px;padding-top:4px;\
                     border-bottom-width:1px;border-color:{line};}} \
-             .mark{{display:inline-block;color:{accent};width:44px;font-size:15px;\
-                   padding-top:5px;padding-bottom:5px;}} \
-             .tab{{display:inline-block;width:{tab_w}px;padding-top:5px;padding-bottom:5px;\
-                  padding-left:10px;padding-right:6px;border-radius:8px;\
-                  border-bottom-width:2px;border-color:{chrome};}} \
-             .active{{display:inline-block;width:{tab_w}px;background:{soft};color:{text};\
-                     padding-top:5px;padding-bottom:5px;padding-left:10px;padding-right:6px;\
-                     border-radius:8px;border-bottom-width:2px;border-color:{accent};}} \
+             .mark{{display:inline-flex;flex-shrink:0;align-items:center;padding-right:10px;}} \
+             .tab{{display:inline-flex;flex-shrink:0;align-items:center;width:{tab_w}px;height:28px;\
+                  padding-left:10px;padding-right:5px;border-radius:9px;}} \
+             .active{{background:{surface};color:{text};border-left-width:3px;\
+                     border-color:{accent};}} \
              .hot{{background:{hover};color:{text};}} \
-             .name{{display:inline-block;width:{name_w}px;}} \
-             .x{{display:inline-block;width:18px;color:{faint};text-align:right;}} \
-             .add{{display:inline-block;color:{muted};width:20px;padding:5px;\
-                  border-radius:7px;text-align:center;}} \
-             .more{{display:inline-block;color:{faint};font-size:12px;padding:6px;}} \
-             .pin{{color:{accent};font-size:9px;}}",
+             .name{{display:inline-block;flex-grow:1;width:{name_w}px;white-space:nowrap;}} \
+             .pin{{display:inline-flex;flex-shrink:0;align-items:center;padding-right:6px;}} \
+             .x{{display:inline-flex;flex-shrink:0;align-items:center;justify-content:center;\
+                width:20px;height:20px;border-radius:6px;}} \
+             .add{{display:inline-flex;flex-shrink:0;align-items:center;justify-content:center;\
+                  width:28px;height:28px;border-radius:8px;}} \
+             .more{{display:inline-flex;flex-shrink:0;align-items:center;color:{faint};font-size:12px;\
+                   padding-left:6px;padding-right:6px;}}",
             tab_w = STRIP_TAB_W - 32,
-            name_w = STRIP_TAB_W - 32 - 34,
-            chrome = theme::CHROME,
-            soft = theme::accent_soft(),
-            hover = theme::HOVER,
-            text = theme::TEXT,
-            muted = theme::MUTED,
-            faint = theme::FAINT,
+            name_w = STRIP_TAB_W - 32 - 40,
+            chrome = theme::chrome(),
+            surface = theme::surface(),
+            hover = theme::hover(),
+            text = theme::text(),
+            muted = theme::muted(),
+            faint = theme::faint(),
             accent = theme::accent(),
-            line = theme::LINE,
+            line = theme::line(),
         )
     }
 
@@ -2226,19 +2656,17 @@ impl App {
                 }
                 if *id == "menu:zoom" {
                     // Zoom is a value, not a destination, so it gets a stepper.
-                    // Laid out in normal flow rather than as a flex row: the
-                    // engine will not hold three small boxes on one flex line.
                     return format!(
                         "<div class=\"zoom\"><span class=\"zlabel\">{zoom_label}</span>\
                          <span id=\"zoom:out\" class=\"{}\">{}</span>\
                          <span id=\"zoom:reset\" class=\"{}\">{}%</span>\
                          <span id=\"zoom:in\" class=\"{}\">{}</span></div>",
                         self.lit("zoom:out", "step"),
-                        icon::MINUS,
+                        icon::minus(self.ink("zoom:out", theme::text())),
                         self.lit("zoom:reset", "level"),
                         self.tab().zoom,
                         self.lit("zoom:in", "step"),
-                        icon::ADD,
+                        icon::add(self.ink("zoom:in", theme::text())),
                         zoom_label = escape(&t("Zoom")),
                     );
                 }
@@ -2261,43 +2689,42 @@ impl App {
 
     fn menu_css() -> String {
         format!(
-            "body{{background:{bar};color:{text};font-size:13px;\
-                  border-width:1px;border-color:{line};\
-                  padding-top:6px;padding-bottom:6px;padding-left:6px;padding-right:6px;}} \
+            "body{{background:{elevated};color:{text};font-size:13.5px;\
+                  border-width:1px;border-color:{line};padding:6px;}} \
              .row{{display:flex;justify-content:space-between;align-items:center;\
-                  padding-top:8px;padding-bottom:8px;padding-left:10px;padding-right:10px;\
-                  border-radius:7px;}} \
+                  height:32px;padding-left:10px;padding-right:10px;border-radius:8px;}} \
              .item{{color:{text};}} \
              .hot{{background:{hover};}} \
              .rule{{height:1px;background:{line};margin-top:6px;margin-bottom:6px;}} \
              .label{{color:{text};}} \
              .key{{color:{faint};font-size:12px;}} \
-             .zoom{{padding-top:8px;padding-bottom:8px;\
-                   padding-left:10px;padding-right:10px;}} \
-             .zlabel{{display:inline-block;color:{text};width:96px;}} \
-             .step{{display:inline-block;background:{surface};color:{text};width:16px;\
-                   padding:4px;border-radius:6px;text-align:center;}} \
-             .level{{display:inline-block;color:{muted};width:44px;font-size:12px;\
-                    padding:4px;text-align:center;border-radius:6px;}}",
-            bar = theme::BAR,
-            surface = theme::SURFACE,
-            hover = theme::HOVER,
-            text = theme::TEXT,
-            muted = theme::MUTED,
-            faint = theme::FAINT,
-            line = theme::LINE,
+             .zoom{{display:flex;align-items:center;height:32px;\
+                   padding-left:10px;padding-right:6px;}} \
+             .zlabel{{display:inline-block;flex-grow:1;color:{text};}} \
+             .step{{display:inline-flex;flex-shrink:0;align-items:center;justify-content:center;\
+                   width:26px;height:26px;border-radius:7px;background:{surface};\
+                   border-width:1px;border-color:{line};}} \
+             .level{{display:inline-flex;flex-shrink:0;align-items:center;justify-content:center;\
+                    color:{muted};width:46px;font-size:12px;border-radius:7px;}}",
+            elevated = theme::elevated(),
+            surface = theme::surface(),
+            hover = theme::hover(),
+            text = theme::text(),
+            muted = theme::muted(),
+            faint = theme::faint(),
+            line = theme::line(),
         )
     }
 
     fn tooltip_css() -> String {
         format!(
-            "body{{background:{surface};color:{text};font-size:12px;\
+            "body{{background:{elevated};color:{text};font-size:12.5px;\
                   border-width:1px;border-color:{line};}} \
-             #tip{{padding-top:6px;padding-bottom:6px;padding-left:10px;padding-right:10px;\
+             #tip{{padding-top:7px;padding-bottom:7px;padding-left:10px;padding-right:10px;\
                   text-align:center;}}",
-            surface = theme::SURFACE,
-            text = theme::TEXT,
-            line = theme::LINE,
+            elevated = theme::elevated(),
+            text = theme::text(),
+            line = theme::line(),
         )
     }
 
@@ -2532,7 +2959,7 @@ impl App {
                     engine,
                     &mut hits,
                     &self.ai_html(),
-                    Self::ai_css(),
+                    &Self::ai_css(),
                     (x, regions.content_y),
                     (regions.ai_w, regions.content_h),
                     false,
@@ -2546,14 +2973,18 @@ impl App {
         let compose_start = std::time::Instant::now();
         // Starts as the canvas colour rather than black, because mid-animation
         // the page can be narrower than the area it is being slid into.
-        let mut buffer = vec![CANVAS_RGB; (w * h) as usize];
+        let canvas_rgb = theme::packed(theme::canvas());
+        // The window shows past the page card on two edges, and that showing
+        // part is chrome — filling it with the page's own colour would make the
+        // card's margin look like a rendering gap.
+        let mut buffer = vec![theme::packed(theme::chrome()); (w * h) as usize];
         let page = self.tabs[self.active].page_canvas.as_ref().expect("rendered above");
         blit_page(
             &mut buffer,
             w,
             h,
             page,
-            (regions.content_x, regions.content_y, regions.content_w),
+            (regions.content_x, regions.content_y, regions.content_w, regions.content_h),
             scroll,
             zoom,
         );
@@ -2569,7 +3000,12 @@ impl App {
                         w,
                         h,
                         canvas,
-                        (regions.other_x, regions.content_y, regions.other_w),
+                        (
+                            regions.other_x,
+                            regions.content_y,
+                            regions.other_w,
+                            regions.content_h,
+                        ),
                         scroll,
                         zoom,
                     );
@@ -2580,7 +3016,8 @@ impl App {
             for y in regions.content_y..h {
                 for x in start..(start + DIVIDER_W).min(w) {
                     let edge = x == start + DIVIDER_W / 2;
-                    buffer[(y * w + x) as usize] = if edge { 0x3a3d45 } else { CANVAS_RGB };
+                    let hairline = theme::packed(theme::line());
+                    buffer[(y * w + x) as usize] = if edge { hairline } else { canvas_rgb };
                 }
             }
         }
@@ -2597,12 +3034,28 @@ impl App {
             let bar_w = SCROLLBAR_W;
             let x0 = (regions.content_x + regions.content_w).saturating_sub(bar_w);
             let thumb_top = regions.content_y + offset as u32;
+            // The track is barely there and the thumb is the only real mark —
+            // a scrollbar says where you are, it does not need to be furniture.
+            let thumb = theme::packed(theme::edge());
+            let track = theme::packed(&theme::mix(theme::edge(), theme::canvas(), 0.14));
             for y in regions.content_y..h {
                 for x in x0..(x0 + bar_w).min(w) {
                     let on_thumb = y >= thumb_top && y < thumb_top + thumb_h as u32;
-                    buffer[(y * w + x) as usize] = if on_thumb { 0x5f636d } else { 0x1a1c21 };
+                    buffer[(y * w + x) as usize] = if on_thumb { thumb } else { track };
                 }
             }
+        }
+
+        // The page is a card on the window, so its corners are rounded and its
+        // edge is ruled — after the scrollbar, which draws inside it.
+        let hairline = theme::packed(theme::line());
+        let behind = theme::packed(theme::chrome());
+        let pane = (regions.content_x, regions.content_y, regions.content_w, regions.content_h);
+        frame_pane(&mut buffer, w, h, pane, hairline, behind);
+        if regions.other_w > 0 {
+            let other =
+                (regions.other_x, regions.content_y, regions.other_w, regions.content_h);
+            frame_pane(&mut buffer, w, h, other, hairline, behind);
         }
 
         // Overlays last, so they sit above the page and the chrome alike.
@@ -2618,7 +3071,7 @@ impl App {
                 (MENU_W, 1), // height comes from the content
                 true,
             );
-            blit(&mut buffer, w, h, &menu, x, y);
+            blit_rounded(&mut buffer, w, h, &menu, x, y, POPOVER_RADIUS);
         }
         if let Some(text) = self.tooltip_text() {
             if let Some((x, y, tw)) = self.tooltip_box(&text, &hits, &regions) {
@@ -2631,7 +3084,7 @@ impl App {
                     (tw, 1),
                     false,
                 );
-                blit(&mut buffer, w, h, &tip, x, y);
+                blit_rounded(&mut buffer, w, h, &tip, x, y, 8);
             }
         }
 
@@ -2666,21 +3119,27 @@ impl App {
         Some((x, y, width))
     }
 
-    fn ai_css() -> &'static str {
-        static CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        CSS.get_or_init(|| {
-            format!(
-                "body{{background:{chrome};color:{muted};font-size:13px;}} \
-                 #head{{background:{surface};color:{text};padding:12px;height:20px;}} \
-                 .line{{padding:3px;color:{text};}} \
-                 .src{{color:{faint};padding:12px;font-size:12px;}}",
-                chrome = theme::CHROME,
-                surface = theme::SURFACE,
-                text = theme::TEXT,
-                muted = theme::MUTED,
-                faint = theme::FAINT,
-            )
-        })
+    /// The assistant panel. Built per call rather than cached for the process:
+    /// the palette can change under it, and a stylesheet held in a `OnceLock`
+    /// would keep drawing in whichever theme happened to be in force first.
+    fn ai_css() -> String {
+        format!(
+            "body{{background:{chrome};color:{muted};font-size:13.5px;\
+                  border-left-width:1px;border-color:{line};}} \
+             #head{{display:flex;align-items:center;background:{chrome};color:{text};\
+                   height:38px;padding-left:16px;padding-right:16px;\
+                   border-bottom-width:1px;border-color:{line};}} \
+             .line{{padding-left:16px;padding-right:16px;padding-top:3px;\
+                   padding-bottom:3px;color:{text};}} \
+             .sec{{color:{muted};font-size:12px;padding-left:16px;padding-right:16px;\
+                  padding-top:18px;padding-bottom:5px;}} \
+             .src{{color:{faint};padding:16px;font-size:12px;}}",
+            chrome = theme::chrome(),
+            text = theme::text(),
+            muted = theme::muted(),
+            faint = theme::faint(),
+            line = theme::line(),
+        )
     }
 
     /// Blit a composed frame to the window.
@@ -2730,13 +3189,14 @@ fn blit_page(
     w: u32,
     h: u32,
     page: &Canvas,
-    (x0, y0, pane_w): (u32, u32, u32),
+    (x0, y0, pane_w, pane_h): (u32, u32, u32, u32),
     scroll: f32,
     zoom: f32,
 ) {
     let inv_zoom = 1.0 / zoom;
     let right = (x0 + pane_w).min(w);
-    for y in y0..h {
+    let bottom = (y0 + pane_h).min(h);
+    for y in y0..bottom {
         let sy = ((y - y0) as f32 + scroll) * inv_zoom;
         let sy = (sy as usize).min(page.height.saturating_sub(1));
         let row = sy * page.width;
@@ -2760,6 +3220,105 @@ fn blit_page(
             }
             let px = page.pixels[row + sx];
             buffer[(y * w + x) as usize] = (px.r as u32) << 16 | (px.g as u32) << 8 | px.b as u32;
+        }
+    }
+}
+
+/// Round a pane's corners and rule its edge.
+///
+/// The compositor copies rectangles, so a card with soft corners is finished
+/// here rather than by the engine: well inside the radius nothing changes,
+/// across it the page gives way to the window behind, and the last pixel or so
+/// is the rule that separates the two.
+fn frame_pane(
+    buffer: &mut [u32],
+    w: u32,
+    h: u32,
+    (x0, y0, pane_w, pane_h): (u32, u32, u32, u32),
+    line: u32,
+    behind: u32,
+) {
+    let (right, bottom) = ((x0 + pane_w).min(w), (y0 + pane_h).min(h));
+    // A pane too small to round is left alone rather than drawn wrong.
+    if right <= x0 + 2 * PAGE_RADIUS || bottom <= y0 + 2 * PAGE_RADIUS {
+        return;
+    }
+    for x in (x0 + PAGE_RADIUS)..(right - PAGE_RADIUS) {
+        buffer[(y0 * w + x) as usize] = line;
+        buffer[((bottom - 1) * w + x) as usize] = line;
+    }
+    for y in (y0 + PAGE_RADIUS)..(bottom - PAGE_RADIUS) {
+        buffer[(y * w + x0) as usize] = line;
+        buffer[(y * w + right - 1) as usize] = line;
+    }
+    let radius = PAGE_RADIUS as f32;
+    for dy in 0..PAGE_RADIUS {
+        for dx in 0..PAGE_RADIUS {
+            // How far this pixel's centre is from the corner's own centre.
+            let (ox, oy) = (radius - dx as f32 - 0.5, radius - dy as f32 - 0.5);
+            let distance = (ox * ox + oy * oy).sqrt();
+            let paint = match distance {
+                d if d > radius + 0.5 => behind,
+                d if d > radius - 0.5 => mix_rgb(behind, line, radius + 0.5 - d),
+                d if d > radius - 1.5 => line,
+                _ => continue, // still page
+            };
+            for (x, y) in [
+                (x0 + dx, y0 + dy),
+                (right - 1 - dx, y0 + dy),
+                (x0 + dx, bottom - 1 - dy),
+                (right - 1 - dx, bottom - 1 - dy),
+            ] {
+                buffer[(y * w + x) as usize] = paint;
+            }
+        }
+    }
+}
+
+/// `ratio` of `over` blended onto `under`, both packed `0xRRGGBB`.
+fn mix_rgb(under: u32, over: u32, ratio: f32) -> u32 {
+    let ratio = ratio.clamp(0.0, 1.0);
+    let channel = |shift: u32| {
+        let (a, b) = ((under >> shift & 255) as f32, (over >> shift & 255) as f32);
+        ((a + (b - a) * ratio).round() as u32) << shift
+    };
+    channel(16) | channel(8) | channel(0)
+}
+
+/// Blit a surface with its corners cut, for something that floats over the page.
+///
+/// A rounded box the engine painted would still arrive as a rectangle, because
+/// the canvas it paints on has no transparency — so the corner is taken off
+/// here, by simply not copying the pixels outside it. What was underneath stays
+/// where it is, which is what makes the corner look cut rather than filled.
+fn blit_rounded(
+    buffer: &mut [u32],
+    w: u32,
+    h: u32,
+    canvas: &Canvas,
+    x0: u32,
+    y0: u32,
+    radius: u32,
+) {
+    let (cw, ch) = (canvas.width as u32, canvas.height as u32);
+    let radius = radius.min(cw / 2).min(ch / 2);
+    for y in 0..ch.min(h.saturating_sub(y0)) {
+        for x in 0..cw.min(w.saturating_sub(x0)) {
+            // How far into a corner this pixel is, if it is in one at all.
+            let dx = radius as f32 - x.min(cw - 1 - x).min(radius) as f32;
+            let dy = radius as f32 - y.min(ch - 1 - y).min(radius) as f32;
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance > radius as f32 {
+                continue; // outside the corner: leave what is under it
+            }
+            let px = canvas.pixels[(y * cw + x) as usize];
+            let paint = (px.r as u32) << 16 | (px.g as u32) << 8 | px.b as u32;
+            let slot = ((y0 + y) * w + x0 + x) as usize;
+            // The last half pixel of the arc fades, or the curve reads as steps.
+            buffer[slot] = match radius as f32 - distance {
+                edge if edge < 1.0 => mix_rgb(buffer[slot], paint, edge.max(0.0)),
+                _ => paint,
+            };
         }
     }
 }
@@ -2830,7 +3389,10 @@ mod tests {
         let expanded = Regions::settled(1000, 700, settings_with(TabLayout::Vertical, Rail::Expanded), false);
         assert_eq!(expanded.rail_w, RAIL_W);
         assert_eq!(expanded.content_x, RAIL_W);
-        assert_eq!(expanded.content_w, 1000 - RAIL_W);
+        // The page is a card with a margin, so it is that much narrower than
+        // the space left over — everything downstream measures the card, not
+        // the gap it sits in.
+        assert_eq!(expanded.content_w, 1000 - RAIL_W - PAGE_GAP);
         assert_eq!(expanded.strip_h, 0);
 
         let icons = Regions::settled(1000, 700, settings_with(TabLayout::Vertical, Rail::Icons), false);
@@ -2839,8 +3401,9 @@ mod tests {
         // Hidden gives the page the whole window width.
         let hidden = Regions::settled(1000, 700, settings_with(TabLayout::Vertical, Rail::Hidden), false);
         assert_eq!(hidden.rail_w, 0);
-        assert_eq!(hidden.content_w, 1000);
+        assert_eq!(hidden.content_w, 1000 - PAGE_GAP);
         assert_eq!(hidden.content_y, TOOLBAR_H);
+        assert_eq!(hidden.content_h, 700 - TOOLBAR_H - PAGE_GAP);
     }
 
     #[test]
@@ -2850,7 +3413,7 @@ mod tests {
         assert_eq!(regions.strip_h, TABSTRIP_H);
         // The page starts below both the strip and the toolbar.
         assert_eq!(regions.content_y, TABSTRIP_H + TOOLBAR_H);
-        assert_eq!(regions.content_w, 1000);
+        assert_eq!(regions.content_w, 1000 - PAGE_GAP);
     }
 
     #[test]
@@ -2925,8 +3488,62 @@ mod tests {
     }
 
     #[test]
-    fn the_canvas_colour_is_the_one_the_chrome_uses() {
-        assert_eq!(format!("#{CANVAS_RGB:06x}"), theme::CANVAS);
+    fn the_mark_rasterizes_for_the_taskbar() {
+        // The window icon is drawn from the same ring the chrome draws, so a
+        // broken path would cost the taskbar its icon silently.
+        let icon = super::window_icon();
+        assert!(icon.is_some(), "the mark did not rasterize");
+        // ...and it is actually a picture, not an empty square.
+        let drawn = zero_engine::svg::rasterize(&icon::ring(theme::text(), 64), 64, 64)
+            .expect("rasterized");
+        let painted = drawn.pixels.iter().filter(|p| p.a > 0).count();
+        assert!(painted > 500, "only {painted} pixels of mark");
+        // The ring has a gap, so its middle stays empty.
+        assert_eq!(drawn.pixels[32 * 64 + 32].a, 0);
+    }
+
+    #[test]
+    fn only_the_browsers_own_screens_share_a_renderer_process() {
+        // Settings is a page whose controls are links, so changing a preference
+        // is a navigation between two `zero://` pages — the one case worth
+        // keeping the process for.
+        assert!(can_share_a_renderer("zero://settings", "zero://settings"));
+        assert!(can_share_a_renderer("zero://newtab", "zero://history"));
+        // Everything the web touches keeps its own process, including one site
+        // following another, and a site returning to a built-in page.
+        assert!(!can_share_a_renderer("https://example.com", "zero://settings"));
+        assert!(!can_share_a_renderer("zero://settings", "https://example.com"));
+        assert!(!can_share_a_renderer("https://a.com", "https://b.com"));
+        assert!(!can_share_a_renderer("https://a.com", "https://a.com"));
+    }
+
+    #[test]
+    fn a_packed_colour_is_the_one_the_chrome_uses() {
+        // The compositor fills whole rectangles itself rather than through the
+        // engine, so it needs the palette as pixels. The two must not drift.
+        assert_eq!(format!("#{:06x}", theme::packed(theme::canvas())), theme::canvas());
+        assert_eq!(format!("#{:06x}", theme::packed("#1a222b")), "#1a222b");
+    }
+
+    #[test]
+    fn each_theme_defines_every_colour_the_other_does() {
+        // A palette with a hole in it is a surface that draws in the wrong
+        // theme's colour, which is only ever noticed by eye. Mixing proves each
+        // value parses as a colour rather than merely being present.
+        for theme_choice in [crate::settings::Theme::Light, crate::settings::Theme::Dark] {
+            let mut settings = Settings::default();
+            settings.theme = theme_choice;
+            crate::settings::preview(settings);
+            let p = theme::palette();
+            for colour in [
+                p.canvas, p.chrome, p.elevated, p.surface, p.hover, p.line, p.text, p.muted,
+                p.faint, p.saved, p.ok, p.link, p.edge, theme::accent(),
+            ] {
+                assert_eq!(colour.len(), 7, "{colour} is not #rrggbb");
+                assert_eq!(theme::mix(colour, colour, 0.5), colour);
+            }
+        }
+        crate::settings::preview(Settings::default());
     }
 
     #[test]

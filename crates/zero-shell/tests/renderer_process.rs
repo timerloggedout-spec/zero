@@ -69,6 +69,48 @@ fn a_page_that_kills_the_renderer_does_not_take_the_browser_with_it() {
 }
 
 #[test]
+fn an_icon_inside_a_link_or_a_span_is_still_drawn() {
+    // `<a><svg/></a>` is how nearly every icon link on the web is written, and
+    // `<span><svg/></span>` is how every icon beside a label is. Inline layout
+    // used to walk an inline element looking only for text, so a replaced
+    // element inside one was never laid out and never painted: the icon simply
+    // was not there. Each of these has to put the same green square on screen.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zero"))
+        .arg("--render-worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the renderer worker");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = child.stdout.take().expect("child stdout");
+    let mut store = std::collections::HashMap::new();
+
+    const ICON: &str =
+        "<svg width='20' height='20' viewBox='0 0 10 10'>         <rect width='10' height='10' fill='#00ff00'/></svg>";
+    let cases = [
+        ("on its own", format!("<div>{ICON}</div>")),
+        ("in a span", format!("<div><span>{ICON}</span></div>")),
+        ("in a link", format!("<div><a href='#'>{ICON}</a></div>")),
+        ("beside text", format!("<div><span>hi {ICON}</span></div>")),
+        ("nested deeper", format!("<div><a href='#'><span><b>{ICON}</b></span></a></div>")),
+    ];
+    for (where_it_is, html) in cases {
+        write_msg(&mut stdin, "render", &[&html, "", ""], &[60.0, 40.0]);
+        let frame = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame");
+        let green = frame
+            .pixels
+            .chunks_exact(4)
+            .filter(|p| p[1] > 200 && p[0] < 80 && p[2] < 80)
+            .count();
+        // A 20×20 icon, give or take the edges the rasterizer softens.
+        assert!(green > 300, "the icon {where_it_is} drew {green} pixels, not a square");
+    }
+
+    drop(stdin);
+    assert!(child.wait().expect("wait").success(), "the worker should exit cleanly");
+}
+
+#[test]
 fn one_render_worker_answers_two_requests_before_it_exits() {
     // `zero-shell`'s `wire` module is a private implementation detail of the
     // binary crate, unreachable from an integration test — so this speaks

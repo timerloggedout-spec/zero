@@ -45,6 +45,9 @@ pub fn serve() {
     // close the filesystem behind us — and only once, since every request
     // after the first reuses the engine already built here.
     let engine = crate::fonts::build_engine();
+    // Finish warming up before the first request rather than during it: a
+    // renderer is often started before anyone is waiting on it.
+    engine.warm();
     let mut input = std::io::stdin();
     let mut output = std::io::stdout();
 
@@ -560,6 +563,44 @@ fn renderer_exe() -> Option<std::path::PathBuf> {
         .or_else(|| std::env::current_exe().ok())
 }
 
+thread_local! {
+    /// One renderer process, started before anything needs it.
+    ///
+    /// Opening a tab spawns a process that reads 74MB of fonts before it can
+    /// draw anything, and the shell blocks on its first frame — about 85ms of
+    /// staring at the old tab. Doing that work ahead of time costs the same
+    /// total, but spends it while nobody is waiting.
+    ///
+    /// ponytail: one spare, not a pool. Opening several tabs at once still
+    /// waits for all but the first; a pool is the fix if that becomes the
+    /// complaint.
+    static WARM: std::cell::RefCell<Option<TabRenderer>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Start a renderer process now so the next tab does not have to wait for one.
+/// Cheap here — the child does its own warming up in parallel.
+pub fn warm() {
+    WARM.with(|spare| {
+        if spare.borrow().is_some() {
+            return;
+        }
+        let started = TabRenderer::start();
+        *spare.borrow_mut() = started;
+    });
+}
+
+/// The waiting renderer, if there is one.
+fn take_warm() -> Option<TabRenderer> {
+    WARM.with(|spare| spare.borrow_mut().take())
+}
+
+/// Shut the spare down. The event loop calls this on its way out so a process
+/// nobody asked for does not outlive the window — a spare that is never adopted
+/// would otherwise sit there until its pipe closed.
+pub fn drop_warm() {
+    WARM.with(|spare| drop(spare.borrow_mut().take()));
+}
+
 /// Render `html` in a child process, fetching whatever it asks for through
 /// `loader` — which stays here, in the process allowed to have it. Spawns,
 /// asks once, tears down: for a page opened and drawn once, not a tab kept
@@ -660,6 +701,29 @@ impl TabRenderer {
         loader: std::rc::Rc<dyn ResourceLoader>,
         store: std::rc::Rc<dyn zero_engine::KeyValueStore>,
     ) -> Option<(TabRenderer, Frame)> {
+        // A renderer that was started earlier has already paid for its fonts,
+        // which is most of what opening a tab used to cost.
+        let mut renderer = take_warm().or_else(Self::start)?;
+        renderer.loader = loader;
+        renderer.store = store;
+        let request = Msg::new("render")
+            .text(html)
+            .text(css)
+            .text("")
+            .num(width as f64)
+            .num(height as f64);
+        let frame = renderer.exchange(request)?;
+        // Start the next one now, so the tab after this one is free too.
+        warm();
+        Some((renderer, frame))
+    }
+
+    /// A renderer process with nothing loaded in it yet.
+    ///
+    /// Its own startup — reading the font chain off disk — happens in the child
+    /// while this returns, so a renderer started ahead of time is ready by the
+    /// time anything asks it to draw.
+    fn start() -> Option<TabRenderer> {
         let exe = renderer_exe()?;
         let mut child: Child = Command::new(exe)
             .arg("--render-worker")
@@ -670,15 +734,44 @@ impl TabRenderer {
         let stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
         let replies = spawn_reader(stdout);
-        let mut renderer = TabRenderer { child, stdin, replies, loader, store, dead: false };
+        Some(TabRenderer {
+            child,
+            stdin,
+            replies,
+            // Replaced the moment a page is given to it; a renderer with nothing
+            // loaded has nothing to fetch and nowhere to store it.
+            loader: std::rc::Rc::new(zero_engine::resource::NullLoader),
+            store: std::rc::Rc::new(crate::localstore::NullStore),
+            dead: false,
+        })
+    }
+
+    /// Give this renderer a different page, keeping the process it runs in.
+    ///
+    /// The worker replaces its whole session, so the new page gets a fresh
+    /// document and a fresh script runtime and inherits nothing from the old one
+    /// but the address space. That is only the right trade between pages that
+    /// already trust each other — the browser's own `zero://` screens, where
+    /// every preference is a link and starting a process to toggle a radio
+    /// button is absurd. Anything from the web still gets its own process.
+    pub fn replace_page(
+        &mut self,
+        html: &str,
+        css: &str,
+        width: f32,
+        height: f32,
+        loader: std::rc::Rc<dyn ResourceLoader>,
+        store: std::rc::Rc<dyn zero_engine::KeyValueStore>,
+    ) -> Option<Frame> {
+        self.loader = loader;
+        self.store = store;
         let request = Msg::new("render")
             .text(html)
             .text(css)
             .text("")
             .num(width as f64)
             .num(height as f64);
-        let frame = renderer.exchange(request)?;
-        Some((renderer, frame))
+        self.exchange(request)
     }
 
     /// Whether this renderer has already failed once (a timeout, or the
@@ -895,6 +988,22 @@ impl FakeRenderer {
     /// Always alive: nothing here can time out or have its pipe close, so
     /// `app.rs`'s crash-recovery path (`Tab::respawn`, `render_pane`'s
     /// `is_dead` check) never has anything to do in a test.
+    pub fn replace_page(
+        &mut self,
+        html: &str,
+        css: &str,
+        width: f32,
+        height: f32,
+        loader: std::rc::Rc<dyn ResourceLoader>,
+        _store: std::rc::Rc<dyn zero_engine::KeyValueStore>,
+    ) -> Option<Frame> {
+        self.loader = loader;
+        self.doc = zero_engine::Document::load(html, css);
+        self.width = width;
+        self.height = height;
+        Some(self.snapshot())
+    }
+
     pub fn is_dead(&self) -> bool {
         false
     }
@@ -1014,6 +1123,27 @@ mod tests {
             start.elapsed() < REPLY_TIMEOUT / 2,
             "a closed pipe should be noticed almost immediately, not by waiting out the timeout"
         );
+    }
+
+    #[test]
+    fn the_spare_renderer_is_handed_over_once_and_then_cleared() {
+        // A unit test's "renderer" is this test binary, which exits immediately
+        // (see `renderer_exe`) — enough to check the bookkeeping, which is what
+        // this owns: one spare is kept, it goes to exactly one tab, and the
+        // window can put it away again on its way out.
+        drop_warm();
+        assert!(take_warm().is_none(), "nothing is warm until something warms it");
+
+        warm();
+        let taken = take_warm();
+        assert!(taken.is_some(), "warm() leaves a renderer waiting");
+        assert!(take_warm().is_none(), "the spare goes to one tab, not two");
+        drop(taken);
+
+        warm();
+        warm(); // already warm: this must not start a second process
+        drop_warm();
+        assert!(take_warm().is_none(), "drop_warm() puts the spare away");
     }
 
     #[test]

@@ -61,11 +61,12 @@ saved settings.
 | `ai` | the assistant panel, open |
 | `hover:star` | a control lit, with its tooltip |
 | `search:wiki` | tab search, filtering |
+| `find:the` | the find bar, with its match count |
 | `tabs:5` | extra tabs, one of them pinned |
 | `split` | two pages side by side |
 | `space:work` | a different profile, with its own accent |
 | `railpx:150` | the tab rail caught mid-slide |
-| `layout=horizontal`, `rail=icons`, `zoom=150`, … | any setting |
+| `theme=dark`, `layout=horizontal`, `rail=icons`, `zoom=150`, … | any setting |
 
 **Keys:** `Ctrl+T` new tab · `Ctrl+Shift+T` reopen closed · `Ctrl+W` close ·
 `Ctrl+Tab` next · `Ctrl+Shift+A` search tabs · `Ctrl+\` collapse the tab rail ·
@@ -90,15 +91,22 @@ cookies, `localStorage`, downloads, settings and encryption key, because a space
 it; the accent colour changes with it, so you can see which profile you are
 typing into.
 
-**Settings** live at `zero://settings` — tab layout (vertical rail or a horizontal
-strip), how far the rail collapses, page zoom, interface language (English or
-हिन्दी), search engine, tracker blocking, session restore and animation. Each control is an ordinary link carrying its new
+**Settings** live at `zero://settings` — theme (light, dark, or whatever your
+desktop is set to), tab layout (vertical rail or a horizontal strip), how far the
+rail collapses, page zoom, interface language (English or हिन्दी), search engine,
+tracker blocking, session restore and animation. Each control is an ordinary link carrying its new
 value (`zero://settings?rail=icons`), so changing a preference goes through the
 same navigation path as clicking any link on the web.
 
-The rail slides open and closed rather than snapping. The engine has no CSS
-transitions, so the shell animates the width itself and asks for the next frame
-only while something is moving — an idle window draws nothing. There is no OS
+The chrome is drawn by Zero's own engine: the rail, the toolbar, the menus and
+the built-in pages are small HTML documents, and the icons in them are inline
+`<svg>` that go through the same rasterizer a website's icons do. The page itself
+sits on the window as a rounded card. If the browser's own buttons look wrong,
+the engine has a bug worth fixing — which is the point.
+
+The rail slides open and closed rather than snapping. The chrome is re-rendered
+from scratch each frame, so the shell animates the width itself and asks for the
+next frame only while something is moving — an idle window draws nothing. There is no OS
 reduced-motion signal available here, so **Animation: Off** in settings is offered
 directly for anyone who wants the change to be instant.
 
@@ -119,7 +127,8 @@ forms.
   `transition` (any property that interpolates),
   `overflow` clipping, custom properties (`var()`, defined on `:root`), the cascade with specificity, HTML presentation attributes (`bgcolor`, `width`, `align`),
   named colours, `rgb()`/`hsl()`, alpha
-- **Layout**: block, inline, inline-block, flex (wrap/grow/justify/align), grid
+- **Layout**: block, inline (including replaced elements nested in one, so an
+  icon inside a link sits on its line), inline-block, flex (wrap/grow/justify/align), grid
   (`repeat()`, `fr`, `minmax()`, spans, named areas), tables (colspan/rowspan),
   floats and `clear`, out-of-flow positioning, intrinsic sizing, `text-align`,
   `white-space: pre`
@@ -132,10 +141,12 @@ forms.
   form submission and search, an on-device page assistant, an English/Hindi
   interface, and input-method text so Indic scripts can be typed
 - **Process model**: startup mitigations (no dynamic code, no injected
-  extensions, strict handles); `--png` renders page content in a separate,
+  extensions, strict handles); page content renders in a separate,
   privilege-dropped process with no network of its own — it asks the parent to
-  fetch, which keeps cookies on the trusted side. Interactive tabs still render
-  in-process
+  fetch, which keeps cookies on the trusted side. Every tab gets one, and the
+  shell keeps a spare already started so opening a tab does not wait for a
+  process to warm up. Moving between two built-in `zero://` screens reuses the
+  process — a settings toggle is a navigation, and it should not cost one
 - **Privacy**: tracker/ad filtering (Adblock syntax), HTTPS-first, cookies and
   `localStorage` partitioned per site, profile data encrypted at rest on all
   three platforms — DPAPI on Windows, AES-256-GCM under a Keychain or Secret
@@ -145,8 +156,10 @@ forms.
 `:has()`) still takes its rule with it, rather than being misapplied. Text does
 not re-widen below a short float — a block beside one keeps its narrowed width
 for its whole height. An SVG is rasterized at its intrinsic size and scaled from
-there, so an icon shown much larger than it declares goes soft. Layout and paint are single-threaded, and a page is
-painted in full rather than by viewport.
+there, so an icon shown much larger than it declares goes soft. Fonts are read at
+startup but parsed only when a page first needs that script, so the first page in
+an unseen script pauses once while its font is read. Layout and paint are
+single-threaded, and a page is painted in full rather than by viewport.
 
 ## The documents
 

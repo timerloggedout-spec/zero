@@ -39,6 +39,51 @@ impl Rail {
     }
 }
 
+/// Which palette the browser draws itself in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Theme {
+    Light,
+    Dark,
+    /// Whatever the desktop is set to.
+    System,
+}
+
+/// Whether the desktop asks for a dark appearance.
+///
+/// Windows keeps this as one registry value, and reading it is cheaper than
+/// taking a dependency for it. Everywhere else the answer is "no" until that
+/// platform's own signal is read — a browser that guesses dark and is wrong is
+/// worse than one that stays light.
+pub fn desktop_prefers_dark() -> bool {
+    #[cfg(windows)]
+    {
+        // `AppsUseLightTheme` is 0 for dark, 1 for light, and absent on an
+        // older Windows that only had the one appearance.
+        let mut value: u32 = 1;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let ok = unsafe {
+            windows_sys::Win32::System::Registry::RegGetValueW(
+                windows_sys::Win32::System::Registry::HKEY_CURRENT_USER,
+                wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize").as_ptr(),
+                wide("AppsUseLightTheme").as_ptr(),
+                windows_sys::Win32::System::Registry::RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                (&mut value as *mut u32).cast(),
+                &mut size,
+            )
+        };
+        ok == 0 && value == 0
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// A Rust string as the null-terminated UTF-16 the Win32 API reads.
+#[cfg(windows)]
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 /// Search engines offered for the address bar and the new-tab field.
 ///
 /// Each is a key, a label, and the prefix a percent-encoded query is appended to.
@@ -62,6 +107,8 @@ pub const ZOOM_STEPS: &[u32] = &[67, 80, 90, 100, 110, 125, 150, 175, 200];
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
     pub layout: TabLayout,
+    /// Which palette the chrome and the built-in pages draw in.
+    pub theme: Theme,
     pub rail: Rail,
     /// Index into [`ENGINES`].
     pub engine: usize,
@@ -82,6 +129,7 @@ impl Default for Settings {
     fn default() -> Settings {
         Settings {
             layout: TabLayout::Vertical,
+            theme: Theme::Light,
             rail: Rail::Expanded,
             engine: 0,
             zoom: 100,
@@ -98,6 +146,9 @@ impl Settings {
     /// stale link cannot silently do nothing.
     pub fn set(&mut self, key: &str, value: &str) -> bool {
         match (key, value) {
+            ("theme", "light") => self.theme = Theme::Light,
+            ("theme", "dark") => self.theme = Theme::Dark,
+            ("theme", "system") => self.theme = Theme::System,
             ("layout", "vertical") => self.layout = TabLayout::Vertical,
             ("layout", "horizontal") => self.layout = TabLayout::Horizontal,
             ("rail", "expanded") => self.rail = Rail::Expanded,
@@ -133,7 +184,12 @@ impl Settings {
 
     fn serialize(&self) -> String {
         format!(
-            "layout={}\nrail={}\nengine={}\nzoom={}\nblocking={}\nrestore={}\nmotion={}\nlang={}\n",
+            "theme={}\nlayout={}\nrail={}\nengine={}\nzoom={}\nblocking={}\nrestore={}\nmotion={}\nlang={}\n",
+            match self.theme {
+                Theme::Light => "light",
+                Theme::Dark => "dark",
+                Theme::System => "system",
+            },
             match self.layout {
                 TabLayout::Vertical => "vertical",
                 TabLayout::Horizontal => "horizontal",
@@ -267,6 +323,7 @@ mod tests {
     fn settings_round_trip_through_their_own_format() {
         let saved = Settings {
             layout: TabLayout::Horizontal,
+            theme: Theme::Dark,
             rail: Rail::Hidden,
             engine: 2,
             zoom: 90,

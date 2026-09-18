@@ -51,30 +51,43 @@ Perplexity Comet. Reference images 1 (split view + vertical tabs) and 2 (dark ne
 
 > These become code-level constants shared between the UI-UX spec and `zero-ui`.
 
-### 3.1 Color — Dark (primary theme, per reference image 2)
+### 3.1 Color — Light (default, and the website's own palette)
+
+Taken from the logo: the slate ink of the ring, the white it sits on, and the
+blue light where its stroke ends. `web/app/globals.css` uses the same values, so
+the site's browser mock-up and the browser are one design.
+
 | Token | Value | Use |
 |-------|-------|-----|
-| `--bg-app` | `#0E0F12` | window background |
-| `--bg-surface` | `#17181C` | sidebar, cards |
-| `--bg-elevated` | `#1F2127` | menus, popovers, search bar |
-| `--bg-hover` | `#26282F` | hover states |
-| `--border-subtle` | `#2A2C33` | dividers, card borders |
-| `--text-primary` | `#F2F3F5` | primary text |
-| `--text-secondary` | `#9A9DA6` | secondary/labels |
-| `--text-tertiary` | `#5F636D` | hints, placeholders |
-| `--accent` | per-space (default `#E5484D` red like ref, or user pick) | active tab, CTAs |
-| `--accent-soft` | 12% accent | active-tab background wash |
-| `--success` | `#30A46C` | privacy/secure indicators |
+| `canvas` | `#FFFFFF` | behind pages |
+| `chrome` | `#F3F5F7` | the window's own surface: rail and toolbar |
+| `elevated` | `#FFFFFF` | menus, tooltips |
+| `surface` | `#FFFFFF` | buttons, cards, the address pill |
+| `hover` | `#E7EAEE` | hover states |
+| `line` | `#E3E7EB` | dividers, card borders |
+| `text` | `#1A222B` | primary text |
+| `muted` | `#5B6570` | secondary/labels |
+| `faint` | `#8A939C` | hints, placeholders |
+| `accent` | per-space (default `#559FF3`, the ring's light) | active tab, CTAs |
+| `ok` | `#2A8F5E` | a secure connection |
+| `saved` | `#D08700` | a bookmarked page |
 
-### 3.2 Color — Light
+### 3.2 Color — Dark
+
 | Token | Value |
 |-------|-------|
-| `--bg-app` | `#F4F5F7` |
-| `--bg-surface` | `#FFFFFF` |
-| `--bg-elevated` | `#FFFFFF` |
-| `--border-subtle` | `#E6E8EC` |
-| `--text-primary` | `#1A1B1E` |
-| `--text-secondary` | `#5F636D` |
+| `canvas` | `#0E0F12` |
+| `chrome` | `#121317` |
+| `elevated` | `#16181D` |
+| `surface` | `#1E2027` |
+| `hover` | `#282B34` |
+| `line` | `#262931` |
+| `text` | `#E8EAED` |
+| `muted` | `#8B919B` |
+| `faint` | `#5F646E` |
+
+Both sets live in `app::theme::Palette`, and the **Theme** preference picks one —
+Light, Dark, or System, which reads the desktop's own setting.
 
 ### 3.3 Typography
 - **UI font:** Inter (or system UI stack fallback); Indic scripts via Noto Sans / Noto Sans Devanagari etc.
@@ -206,10 +219,10 @@ Built items are live in the Rust shell (`crates/zero-shell/src/app.rs`) and can 
 screenshotted headlessly with `--shot`'s poses — see the README.
 
 - [ ] First-run / onboarding (language, import, privacy explainer)
-- [x] Main window — single tab (dark; light still to come)
+- [x] Main window — single tab, light and dark
 - [x] Main window — vertical tabs expanded / icons / hidden, and a horizontal strip
 - [ ] Split view (2 panes) + context menu
-- [x] New-tab page (dark, per ref 2) — light variant to come
+- [x] New-tab page — the mark, one field, and the sites you actually use
 - [x] Find-in-page bar; command-bar AI states still to come
 - [x] AI sidebar (chat with page); agentic confirmation card to come
 - [ ] Spaces switcher + space theming
@@ -223,10 +236,22 @@ screenshotted headlessly with `--shot`'s poses — see the README.
 The chrome is rendered by Zero's own engine as small HTML documents, which
 constrains the visual language in ways worth recording:
 
-- **No `font-weight`.** Hierarchy comes from size, colour and spacing alone.
-  Brightness is the weight axis: `--text-primary` reads as bold, `--text-secondary`
-  as regular, `--text-tertiary` as light.
-- **No CSS transitions.** Motion has to be animated by the shell instead. The tab
+- **No `font-family`.** The engine draws every string from one fallback chain, so
+  the chrome cannot ask for a different face from the page — which is why the UI
+  is set in the system's own UI font rather than the website's Outfit. Bundling it
+  would change what *pages* look like too.
+- **No `font-weight` worth leaning on.** A heavier weight is synthesized rather
+  than picked from a face, so hierarchy comes from size, colour and spacing.
+  Brightness is the weight axis: `text` reads as bold, `muted` as regular,
+  `faint` as light.
+- **Icons are inline `<svg>`,** drawn by the engine's own rasterizer — the same
+  code a page's icons go through. Each is told its colour, because `currentColor`
+  has no cascade to read inside an SVG.
+- **Round corners on a floating surface are the compositor's job.** The engine
+  paints onto an opaque canvas, so a menu, a tooltip and the page card get their
+  corners cut in `blit_rounded`/`frame_pane` rather than by `border-radius`.
+- **CSS transitions exist now** but the chrome does not use them: it is re-rendered
+  per frame from scratch, so there is no previous value to interpolate from. The tab
   rail's width eases toward its target with exponential smoothing (~260ms), and
   the window requests the next frame only while something is moving. The rail's
   markup is sized from its *current* width, not its setting, so it squeezes its
@@ -238,8 +263,10 @@ constrains the visual language in ways worth recording:
 - **Hairlines carry the structure** that bolder type would otherwise carry, which
   is why `--border-subtle` does much more work here than the spec anticipated.
 - **The accent marks position, never fills.** The active tab takes an accent
-  *edge* — left in the rail, bottom in the horizontal strip, bottom on the chosen
-  segment in Settings. The only accent fill in the product is the wordmark.
+  *edge* — left in the rail and in the horizontal strip, bottom on the chosen
+  segment in Settings, and the space's dot in the rail's footer. Nothing in the
+  product is filled with it. The mark itself is not themed at all: the ring is
+  ink with its own blue light, whatever the space's colour is.
 - **No `text-overflow`.** Labels are truncated in Rust to a character count that
   fits, because an over-long label wraps and is clipped instead of trailing off.
 
