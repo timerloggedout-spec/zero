@@ -30,7 +30,7 @@ pub mod svg;
 pub mod text;
 
 pub use css::Color;
-pub use layout::{ElementRect, LinkArea};
+pub use layout::{ElementRect, LinkArea, TextRun};
 pub use paint::Canvas;
 pub use resource::{DecodedImage, KeyValueStore, ResourceLoader};
 
@@ -55,6 +55,10 @@ pub struct Page {
     pub element_rects: Vec<ElementRect>,
     /// Boxes of the find-in-page matches, in document order.
     pub find_matches: Vec<layout::Rect>,
+    /// Every painted word and where it was drawn, in reading order. Selecting
+    /// and copying text is the embedder's job — it owns the mouse — and this is
+    /// what it needs from the engine to do it.
+    pub text_runs: Vec<TextRun>,
     /// Whether any rule used `:hover`. Without this the embedder would repaint
     /// on every mouse move for pages that do not react to the cursor at all.
     pub uses_hover: bool,
@@ -846,6 +850,8 @@ impl Engine {
         layout::collect_links(&layout_root, &mut links);
         let mut element_rects = Vec::new();
         layout::collect_element_rects(&layout_root, &mut element_rects);
+        let mut text_runs = Vec::new();
+        layout::collect_text_runs(&layout_root, &mut text_runs);
         Page {
             canvas,
             doc_height,
@@ -854,6 +860,7 @@ impl Engine {
             console,
             element_rects,
             find_matches,
+            text_runs,
             uses_hover,
             animating: doc.anim.is_active(),
         }

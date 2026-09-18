@@ -71,6 +71,7 @@ saved settings.
 
 **Keys:** `Ctrl+T` new tab · `Ctrl+Shift+T` reopen closed · `Ctrl+W` close ·
 `Ctrl+Tab` next · `Ctrl+Shift+A` search tabs · `Ctrl+\` collapse the tab rail ·
+`Ctrl+A` select the page · `Ctrl+C` copy the selection ·
 `Ctrl+L` clear address · `Ctrl+F` find · `Ctrl+D` bookmark · `Ctrl+S` save page ·
 `Ctrl+H` history · `Ctrl+B` bookmarks · `Ctrl+J` downloads · `Ctrl+,` settings ·
 `Ctrl+U` view source · `Ctrl+R` reload · `Ctrl+I` AI panel ·
@@ -139,6 +140,8 @@ forms.
   `super`, `try/catch/finally`, regex literals, `setTimeout`, `JSON`, `fetch`
   with promises and `await`, DOM query and mutation, events
 - **Browser**: vertical tabs, split view, spaces (separate profiles), session restore, history, bookmarks, find-in-page,
+  text selection (drag, double-click a word, triple-click a line, `Ctrl+A`) and
+  `Ctrl+C` to the system clipboard,
   form submission and search, an on-device page assistant, an English/Hindi
   interface, and input-method text so Indic scripts can be typed
 - **Process model**: startup mitigations (no dynamic code, no injected
@@ -160,7 +163,9 @@ for its whole height. An SVG is rasterized at its intrinsic size and scaled from
 there, so an icon shown much larger than it declares goes soft. Fonts are read at
 startup but parsed only when a page first needs that script, so the first page in
 an unseen script pauses once while its font is read. Layout and paint are
-single-threaded, and a page is painted in full rather than by viewport.
+single-threaded, and a page is painted in full rather than by viewport. A
+selection is whole words: shaping throws characters away, so half a word cannot
+be selected and the copied text has its spacing rebuilt rather than preserved.
 
 ## The documents
 

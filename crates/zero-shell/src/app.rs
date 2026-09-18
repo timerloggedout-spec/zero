@@ -42,7 +42,7 @@ use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, W
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
-use zero_engine::{Canvas, ElementRect, Engine};
+use zero_engine::{Canvas, ElementRect, Engine, TextRun};
 
 const RAIL_W: u32 = 236;
 /// Wide enough for one initial plus breathing room, per docs/02-UI-UX-SPEC.md §3.4.
@@ -54,6 +54,19 @@ const TABSTRIP_H: u32 = 38;
 const TOOLBAR_H: u32 = 48;
 const AI_PANEL_W: u32 = 320;
 const SCROLLBAR_W: u32 = 12;
+/// How far the mouse travels with the button down before it is a drag and not
+/// a click. Without it, a hand that moves a pixel while clicking a link would
+/// select instead of following it.
+const DRAG_SLOP: f32 = 3.0;
+/// How long after a press a second one still counts as a double-click, and how
+/// far it may land from the first. Windows' own default is 500 ms; matching it
+/// is what makes the browser feel like the rest of the desktop.
+const MULTI_CLICK: std::time::Duration = std::time::Duration::from_millis(500);
+const MULTI_CLICK_SLOP: f32 = 4.0;
+/// The selection wash, drawn over the painted page rather than into it: the
+/// text it covers has to stay readable, so this is a tint, not a fill.
+const SELECTION_TINT: (u32, u32, u32) = (56, 110, 226);
+const SELECTION_ALPHA: u32 = 90; // out of 255
 /// A placeholder viewport for a tab's very first render, before its real
 /// size is known — `render_pane` asks again at the window's actual size on
 /// the next frame regardless, since `cache_w`/`cache_h` start unset.
@@ -766,6 +779,94 @@ fn initial(label: &str) -> String {
         .unwrap_or_else(|| "\u{2022}".to_string())
 }
 
+/// What is selected on a page, in page coordinates.
+///
+/// Kept as the *points* the mouse was at rather than as a list of words,
+/// because the words move: a resize, a zoom or a script re-lays the page out
+/// under a selection that is still meant to be the same sentence. Resolving it
+/// against the current runs each frame is also what lets select-all be one
+/// variant rather than a special case threaded through everything.
+#[derive(Clone, Copy)]
+enum Selection {
+    /// Pressed at one point and dragged to another — or extended with Shift,
+    /// which moves `focus` and leaves `anchor` where it was.
+    Span { anchor: (f32, f32), focus: (f32, f32) },
+    /// Double-click: the word under the point.
+    Word((f32, f32)),
+    /// Triple-click: the line under the point.
+    Line((f32, f32)),
+    /// Ctrl+A.
+    All,
+}
+
+/// Whether `point` falls inside a run's box.
+fn run_holds(run: &TextRun, (x, y): (f32, f32)) -> bool {
+    x >= run.x && x < run.x + run.width && y >= run.y && y < run.y + run.height
+}
+
+/// Where a run sits in reading order: down the page first, then across it.
+/// The run's centre, so which side of a word a boundary falls on is decided by
+/// whether the cursor passed its middle.
+fn run_key(run: &TextRun) -> (f32, f32) {
+    (run.y + run.height / 2.0, run.x + run.width / 2.0)
+}
+
+/// Where a *point* sits in reading order.
+///
+/// Its row is snapped to the middle of whatever line it landed in, so two
+/// points on the same line compare by x alone — which is what dragging along a
+/// line has to mean. A point in the gutter between lines keeps its own y and so
+/// sorts between them, which is what dragging past the end of a line has to mean.
+fn point_key(runs: &[TextRun], (x, y): (f32, f32)) -> (f32, f32) {
+    let row = runs
+        .iter()
+        .find(|r| y >= r.y && y < r.y + r.height)
+        .map_or(y, |r| r.y + r.height / 2.0);
+    (row, x)
+}
+
+/// The runs a selection covers, in reading order.
+fn selected_runs(runs: &[TextRun], selection: Selection) -> Vec<&TextRun> {
+    match selection {
+        Selection::All => runs.iter().collect(),
+        Selection::Word(point) => runs.iter().filter(|r| run_holds(r, point)).take(1).collect(),
+        // Runs on one line all carry that line's top as their `y`, set once by
+        // inline layout — so "the same line" is an exact comparison, not a
+        // tolerance.
+        Selection::Line(point) => match runs.iter().find(|r| run_holds(r, point)) {
+            Some(line) => runs.iter().filter(|r| r.y == line.y).collect(),
+            None => Vec::new(),
+        },
+        Selection::Span { anchor, focus } => {
+            let (a, b) = (point_key(runs, anchor), point_key(runs, focus));
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            runs.iter().filter(|r| (lo..=hi).contains(&run_key(r))).collect()
+        }
+    }
+}
+
+/// The selected words as text: a space between words, a newline between lines.
+///
+/// ponytail: word-granular. Inline layout keeps one fragment per word and
+/// throws the original spacing away, so this rebuilds it — a run of two spaces
+/// cannot come back, and half a word cannot be selected. Character granularity
+/// needs glyph-to-character mapping through shaping, which is the same thing
+/// find-in-page's own highlight is waiting on.
+fn selection_text(runs: &[&TextRun]) -> String {
+    let mut out = String::new();
+    let mut row: Option<f32> = None;
+    for run in runs {
+        match row {
+            Some(y) if y == run.y => out.push(' '),
+            Some(_) => out.push('\n'),
+            None => {}
+        }
+        out.push_str(&run.text);
+        row = Some(run.y);
+    }
+    out
+}
+
 /// Everything that belongs to one tab, including its own history and render cache.
 struct Tab {
     address: String,
@@ -791,6 +892,13 @@ struct Tab {
     links: Vec<zero_engine::LinkArea>,
     /// Find-in-page match boxes from the last render, for jumping between them.
     matches: Vec<zero_engine::layout::Rect>,
+    /// Every painted word of the last render, in reading order — what a
+    /// selection is resolved against. Chrome-side, so dragging across a
+    /// paragraph costs no round trip to the renderer and no re-layout.
+    text_runs: Vec<TextRun>,
+    /// What the mouse has selected on this page, if anything. Per tab, so the
+    /// two panes of a split each keep their own.
+    selection: Option<Selection>,
     /// Whether the last render's stylesheet reacted to the cursor at all.
     uses_hover: bool,
     /// The page element the cursor was over last, so `update_hover` only
@@ -884,6 +992,8 @@ impl Tab {
             page_canvas: None,
             links: Vec::new(),
             matches: Vec::new(),
+            text_runs: Vec::new(),
+            selection: None,
             uses_hover: false,
             hovered_node: None,
             source,
@@ -922,6 +1032,7 @@ impl Tab {
         self.doc_height = frame.doc_height;
         self.cache_w = w;
         self.cache_h = h;
+        self.text_runs = frame.text_runs; // moved out, so last: `frame` is borrowed above
     }
 
     /// Replace a dead renderer with a fresh one, reloading the same page the
@@ -1110,6 +1221,15 @@ struct App {
     /// Whether the last frame left something mid-animation and so owes another.
     animating: bool,
     dragging_scrollbar: bool,
+    /// Where on the page the left button went down, and whether the mouse has
+    /// moved far enough since for this to be a drag rather than a click. A
+    /// press over the page starts a selection; a release that never dragged is
+    /// the click, which is why the page's click routing waits for the release.
+    pressed: Option<(f32, f32)>,
+    dragged: bool,
+    /// When and where the last press landed, and how many presses have landed
+    /// in the same spot in a row — two is a word, three is a line.
+    click_run: Option<(std::time::Instant, (f32, f32), u32)>,
     /// The tab sharing the window, if the view is split. Always a different tab
     /// from the active one; the pair is drawn in tab order, so which side each
     /// sits on does not change when focus moves between them.
@@ -1143,6 +1263,9 @@ impl App {
             hits: Vec::new(),
             hovered: None,
             dragging_scrollbar: false,
+            pressed: None,
+            dragged: false,
+            click_run: None,
             split: None,
             split_ratio: 0.5,
             dragging_divider: false,
@@ -1226,13 +1349,26 @@ impl ApplicationHandler for App {
                     let regions = self.regions();
                     self.scroll_to_cursor(self.cursor.1, &regions);
                     self.request_redraw();
+                } else if self.pressed.is_some() {
+                    self.extend_selection();
                 } else {
                     self.update_hover();
                 }
             }
-            WindowEvent::MouseInput { state: ElementState::Released, .. } => {
+            WindowEvent::MouseInput { state: ElementState::Released, button, .. } => {
                 self.dragging_scrollbar = false;
                 self.dragging_divider = false;
+                // A press that never became a drag was a click, and the page
+                // finds out about it now: pressing on a link and dragging off
+                // it is how you select its text rather than follow it.
+                if button == MouseButton::Left {
+                    if let Some(point) = self.pressed.take() {
+                        if !std::mem::take(&mut self.dragged) {
+                            self.click_page(point);
+                            self.request_redraw();
+                        }
+                    }
+                }
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
@@ -1649,6 +1785,8 @@ impl App {
                 ("t", false) => self.new_tab(),
                 ("t", true) => self.reopen_closed(),
                 ("a", true) => self.open_tab_search(),
+                ("a", false) => self.tab_mut().selection = Some(Selection::All),
+                ("c", _) => self.copy_selection(),
                 ("w", _) => {
                     let active = self.active;
                     self.close_tab_at(active);
@@ -1759,7 +1897,86 @@ impl App {
             return; // the assistant panel is not the page
         }
 
-        let Some((px, py)) = self.page_coords((cx, cy), &regions) else { return };
+        let Some(point) = self.page_coords((cx, cy), &regions) else { return };
+        self.press_page(point);
+    }
+
+    /// The left button went down on the page. This starts a selection rather
+    /// than acting: what the press *means* is only known on release (a click)
+    /// or on the first movement (a drag), and a double or triple press means
+    /// something else again.
+    fn press_page(&mut self, point: (f32, f32)) {
+        let now = std::time::Instant::now();
+        // Three presses close together and close by are one gesture. The window
+        // never sees a double-click event of its own — winit reports presses —
+        // so the run is counted here.
+        let run = match self.click_run {
+            Some((at, (x, y), n))
+                if now.duration_since(at) < MULTI_CLICK
+                    && (point.0 - x).abs() < MULTI_CLICK_SLOP
+                    && (point.1 - y).abs() < MULTI_CLICK_SLOP =>
+            {
+                n + 1
+            }
+            _ => 1,
+        };
+        self.click_run = Some((now, point, run));
+        self.pressed = Some(point);
+        self.dragged = run > 1; // a double or triple press has already selected
+        let extend = self.modifiers.shift_key();
+        let tab = self.tab_mut();
+        tab.selection = match (run, tab.selection) {
+            (2, _) => Some(Selection::Word(point)),
+            (3.., _) => Some(Selection::Line(point)),
+            // Shift keeps the anchor and moves the far end, so a selection can
+            // be grown after the fact without dragging it again.
+            (_, Some(Selection::Span { anchor, .. })) if extend => {
+                Some(Selection::Span { anchor, focus: point })
+            }
+            // Shift after a double- or triple-click has no anchor of its own to
+            // keep, so the selection's own first word stands in for one.
+            (_, Some(existing)) if extend => {
+                let anchor = selected_runs(&tab.text_runs, existing)
+                    .first()
+                    .map_or(point, |r| (r.x, r.y + r.height / 2.0));
+                Some(Selection::Span { anchor, focus: point })
+            }
+            // A plain press clears what was selected; the drag, if there is
+            // one, puts a new selection back.
+            _ => None,
+        };
+        self.request_redraw();
+    }
+
+    /// The mouse moved with the button down: select from the press to here.
+    fn extend_selection(&mut self) {
+        let Some(anchor) = self.pressed else { return };
+        let regions = self.regions();
+        let Some(focus) = self.page_coords(self.cursor, &regions) else { return };
+        // A few pixels of travel is a shaky click, not a drag — without this a
+        // hand that moves while clicking would never reach `click_page`, and
+        // links would stop working.
+        if !self.dragged
+            && (focus.0 - anchor.0).abs() < DRAG_SLOP
+            && (focus.1 - anchor.1).abs() < DRAG_SLOP
+        {
+            return;
+        }
+        self.dragged = true;
+        self.tab_mut().selection = Some(Selection::Span { anchor, focus });
+        self.request_redraw();
+    }
+
+    /// Put the selected text on the system clipboard.
+    fn copy_selection(&mut self) {
+        let tab = self.tab();
+        let Some(selection) = tab.selection else { return };
+        crate::clipboard::set(&selection_text(&selected_runs(&tab.text_runs, selection)));
+    }
+
+    /// A press on the page that turned out to be a click: links, focus and
+    /// script handlers, exactly as it was decided when this ran on the press.
+    fn click_page(&mut self, (px, py): (f32, f32)) {
         // Innermost element wins, so a handler on a child beats one on its parent.
         let hit = self
             .tab()
@@ -2004,6 +2221,7 @@ impl App {
         };
         tab.source = body;
         tab.matches.clear();
+        tab.selection = None; // it pointed at words on the page being replaced
         tab.scroll_y = 0.0;
         tab.apply_frame(frame, w as u32, h as u32);
         let address = tab.address.clone();
@@ -3076,6 +3294,18 @@ impl App {
             zoom,
             self.tabs[self.active].band_top,
         );
+        if let Some(selection) = self.tabs[self.active].selection {
+            let tab = &self.tabs[self.active];
+            tint_selection(
+                &mut buffer,
+                w,
+                h,
+                (regions.content_x, regions.content_y, regions.content_w, regions.content_h),
+                scroll,
+                zoom,
+                &selected_runs(&tab.text_runs, selection),
+            );
+        }
         // The other pane, drawn the same way the focused one just was.
         if regions.other_w > 0 {
             if let Some(other) = self.split {
@@ -3098,6 +3328,22 @@ impl App {
                         zoom,
                         tab.band_top,
                     );
+                    if let Some(selection) = tab.selection {
+                        tint_selection(
+                            &mut buffer,
+                            w,
+                            h,
+                            (
+                                regions.other_x,
+                                regions.content_y,
+                                regions.other_w,
+                                regions.content_h,
+                            ),
+                            scroll,
+                            zoom,
+                            &selected_runs(&tab.text_runs, selection),
+                        );
+                    }
                 }
             }
             // The divider: a hairline in the gap, so the two pages read as two.
@@ -3317,6 +3563,68 @@ fn blit_page(
             buffer[(y * w + x) as usize] = (px.r as u32) << 16 | (px.g as u32) << 8 | px.b as u32;
         }
     }
+}
+
+/// Wash the selected words with a tint, over the page the compositor has just
+/// blitted.
+///
+/// Drawn here rather than by the engine because the selection belongs to the
+/// browser, not to the page — and because going through the engine would mean a
+/// re-layout and a re-render for every pixel the mouse moves while dragging.
+fn tint_selection(
+    buffer: &mut [u32],
+    w: u32,
+    h: u32,
+    (x0, y0, pane_w, pane_h): (u32, u32, u32, u32),
+    scroll: f32,
+    zoom: f32,
+    runs: &[&TextRun],
+) {
+    let right = (x0 + pane_w).min(w);
+    let bottom = (y0 + pane_h).min(h);
+    for (i, run) in runs.iter().enumerate() {
+        // The space between two selected words on the same line belongs to the
+        // selection. Inline layout keeps a fragment per word and none for the
+        // gaps, so without this the wash comes out striped. Only a gap narrow
+        // enough to be a space is bridged — two columns that happen to share a
+        // row are not one run of text.
+        let width = match runs.get(i + 1) {
+            Some(next)
+                if next.y == run.y
+                    && next.x > run.x
+                    && next.x - (run.x + run.width) <= run.height =>
+            {
+                next.x - run.x
+            }
+            _ => run.width,
+        };
+        // The inverse of `blit_page`'s window row -> document row.
+        let left = x0 as f32 + run.x * zoom;
+        let top = y0 as f32 + run.y * zoom - scroll;
+        // Float-to-int casts saturate, so a run scrolled off the top clamps to
+        // zero and its range comes out empty rather than wrapping.
+        let x_from = (left.max(x0 as f32) as u32).min(right);
+        let x_to = ((left + width * zoom).max(0.0) as u32).min(right);
+        let y_from = (top.max(y0 as f32) as u32).min(bottom);
+        let y_to = ((top + run.height * zoom).max(0.0) as u32).min(bottom);
+        for y in y_from..y_to {
+            for x in x_from..x_to {
+                let slot = &mut buffer[(y * w + x) as usize];
+                *slot = tinted(*slot);
+            }
+        }
+    }
+}
+
+/// Blend [`SELECTION_TINT`] over one packed pixel, so the words underneath stay
+/// readable instead of being painted out.
+fn tinted(pixel: u32) -> u32 {
+    let (r, g, b) = SELECTION_TINT;
+    let mix = |shift: u32, tint: u32| {
+        let base = (pixel >> shift) & 0xff;
+        ((base * (255 - SELECTION_ALPHA) + tint * SELECTION_ALPHA) / 255) << shift
+    };
+    mix(16, r) | mix(8, g) | mix(0, b)
 }
 
 /// Round a pane's corners and rule its edge.
@@ -3929,5 +4237,88 @@ mod tests {
         let scroll = scroll_for_cursor(content, viewport, 300.0);
         let (top, thumb) = scrollbar_thumb(content, viewport, scroll).unwrap();
         assert!((top + thumb / 2.0 - 300.0).abs() < 1.0, "thumb centre should follow cursor");
+    }
+
+    /// Two lines of three words each, laid out the way inline layout lays them
+    /// out: every word on a line shares that line's top as its `y`.
+    fn two_lines() -> Vec<TextRun> {
+        let words = [
+            ("The", 0.0, 0.0, 30.0),
+            ("quick", 34.0, 0.0, 50.0),
+            ("fox", 88.0, 0.0, 30.0),
+            ("jumps", 0.0, 20.0, 50.0),
+            ("over", 54.0, 20.0, 40.0),
+            ("it", 98.0, 20.0, 16.0),
+        ];
+        words
+            .iter()
+            .map(|(text, x, y, width)| TextRun {
+                text: text.to_string(),
+                x: *x,
+                y: *y,
+                width: *width,
+                height: 20.0,
+            })
+            .collect()
+    }
+
+    fn selected(runs: &[TextRun], selection: Selection) -> String {
+        selection_text(&selected_runs(runs, selection))
+    }
+
+    #[test]
+    fn a_drag_selects_from_where_it_started_to_where_it_ended() {
+        let runs = two_lines();
+        // Across one line: from inside "The" to past the middle of "fox".
+        let span = Selection::Span { anchor: (5.0, 10.0), focus: (110.0, 10.0) };
+        assert_eq!(selected(&runs, span), "The quick fox");
+        // Dragged backwards is the same selection, not an empty one.
+        let back = Selection::Span { anchor: (110.0, 10.0), focus: (5.0, 10.0) };
+        assert_eq!(selected(&runs, back), "The quick fox");
+        // Across lines, the line break comes back as one.
+        let down = Selection::Span { anchor: (40.0, 10.0), focus: (60.0, 30.0) };
+        assert_eq!(selected(&runs, down), "quick fox\njumps");
+        // A click selects nothing: both ends land in the same place.
+        let click = Selection::Span { anchor: (40.0, 10.0), focus: (40.0, 10.0) };
+        assert_eq!(selected(&runs, click), "");
+    }
+
+    #[test]
+    fn double_click_takes_a_word_triple_click_a_line_and_ctrl_a_the_page() {
+        let runs = two_lines();
+        assert_eq!(selected(&runs, Selection::Word((40.0, 10.0))), "quick");
+        assert_eq!(selected(&runs, Selection::Line((40.0, 10.0))), "The quick fox");
+        // The second line, not the first: a line is picked by where the click
+        // landed, and the two share nothing but their words' height.
+        assert_eq!(selected(&runs, Selection::Line((60.0, 30.0))), "jumps over it");
+        assert_eq!(selected(&runs, Selection::All), "The quick fox\njumps over it");
+        // A gesture that lands in the margin selects nothing rather than
+        // guessing at the nearest word.
+        assert_eq!(selected(&runs, Selection::Word((300.0, 10.0))), "");
+        assert_eq!(selected(&runs, Selection::Line((300.0, 10.0))), "");
+    }
+
+    #[test]
+    fn a_selection_boundary_falls_on_whichever_side_of_a_word_the_cursor_passed() {
+        let runs = two_lines();
+        // "quick" spans 34..84, so its middle is 59. Stopping before the middle
+        // leaves it out; stopping past the middle takes it.
+        let short = Selection::Span { anchor: (5.0, 10.0), focus: (50.0, 10.0) };
+        assert_eq!(selected(&runs, short), "The");
+        let long = Selection::Span { anchor: (5.0, 10.0), focus: (70.0, 10.0) };
+        assert_eq!(selected(&runs, long), "The quick");
+    }
+
+    #[test]
+    fn the_selection_tint_lightens_a_pixel_without_replacing_it() {
+        // Black text under the wash stays darker than the white page around it
+        // — the whole point of tinting rather than filling.
+        let (ink, paper) = (tinted(0x000000), tinted(0xffffff));
+        assert!(ink < paper, "tinted text must stay darker than tinted background");
+        assert_ne!(paper, 0xffffff, "the wash has to be visible on a white page");
+        // The blend is integer maths on bytes: nothing may carry past the top
+        // of the pixel, and what comes out has to read as the blue it is.
+        assert!(paper < 0x100_0000, "the blend must stay inside three channels");
+        assert!(paper & 0xff > (paper >> 16) & 0xff, "more blue left than red");
     }
 }

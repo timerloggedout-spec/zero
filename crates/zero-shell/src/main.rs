@@ -16,6 +16,7 @@
 mod ai;
 mod app;
 mod blocker;
+mod clipboard;
 mod cookies;
 mod crypto;
 mod fonts;

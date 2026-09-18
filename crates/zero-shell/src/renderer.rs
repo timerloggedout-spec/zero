@@ -232,14 +232,15 @@ impl Session {
 ///
 /// Packed into `Msg`'s plain `text`/`nums` arrays rather than a new format —
 /// `nums` lays out as `[w, h, uses_hover, animating, is_focused, rect_count,
-/// link_count, match_count]` followed by `rect_count` groups of
-/// `[node_id, x, y, w, h]`, then `link_count` groups of `[x, y, w, h]`, then
-/// `match_count` groups of `[x, y, w, h]`, then two trailing flags,
+/// link_count, match_count, doc_height, band_top, run_count]` followed by
+/// `rect_count` groups of `[node_id, x, y, w, h]`, then `link_count` groups of
+/// `[x, y, w, h]`, then `match_count` groups of `[x, y, w, h]`, then
+/// `run_count` groups of `[x, y, w, h]`, then two trailing flags,
 /// `has_submission` and `click_handled`; `text` is `[title, ...rect ids,
-/// ...link hrefs, submit_action, submit_query]` in the same order — the
-/// submission fields are always last, so decoding them needs no new offset
-/// math, just `nums`/`text`'s own lengths. One schema, documented once, same
-/// as every other message this pipe carries.
+/// ...link hrefs, ...run words, submit_action, submit_query]` in the same
+/// order — the submission fields are always last, so decoding them needs no new
+/// offset math, just `nums`/`text`'s own lengths. One schema, documented once,
+/// same as every other message this pipe carries.
 fn write_frame(engine: &Engine, session: &mut Session, output: &mut std::io::Stdout) {
     session.doc.set_time(session.created.elapsed().as_secs_f32() * 1000.0);
     let loader = PipeLoader;
@@ -265,7 +266,8 @@ fn write_frame(engine: &Engine, session: &mut Session, output: &mut std::io::Std
         // the canvas is one screenful, and the scrollbar has to size itself
         // against the document rather than against what was painted.
         .num(page.doc_height as f64)
-        .num(page.band_top as f64);
+        .num(page.band_top as f64)
+        .num(page.text_runs.len() as f64);
     for r in &page.element_rects {
         answer = answer.num(r.node_id as f64).num(r.x as f64).num(r.y as f64);
         answer = answer.num(r.width as f64).num(r.height as f64);
@@ -276,11 +278,17 @@ fn write_frame(engine: &Engine, session: &mut Session, output: &mut std::io::Std
     for m in &page.find_matches {
         answer = answer.num(m.x as f64).num(m.y as f64).num(m.width as f64).num(m.height as f64);
     }
+    for r in &page.text_runs {
+        answer = answer.num(r.x as f64).num(r.y as f64).num(r.width as f64).num(r.height as f64);
+    }
     for r in &page.element_rects {
         answer = answer.text(r.id.clone());
     }
     for l in &page.links {
         answer = answer.text(l.href.clone());
+    }
+    for r in &page.text_runs {
+        answer = answer.text(r.text.clone());
     }
     let submission = session.pending_submission.take();
     answer = answer
@@ -378,6 +386,10 @@ pub struct Frame {
     pub element_rects: Vec<zero_engine::ElementRect>,
     pub links: Vec<zero_engine::LinkArea>,
     pub find_matches: Vec<zero_engine::layout::Rect>,
+    /// Every painted word and its box, in reading order — what selecting and
+    /// copying text on this page is done against, chrome-side, with no round
+    /// trip per mouse move.
+    pub text_runs: Vec<zero_engine::TextRun>,
     /// Set only on the reply to a `submit` message, and only when the
     /// focused field was actually inside a `<form>`.
     pub submission: Option<zero_engine::Submission>,
@@ -394,8 +406,9 @@ fn decode_frame(msg: Msg) -> Frame {
     let (width, height) = (get(0) as usize, get(1) as usize);
     let (rect_count, link_count, match_count) = (get(5) as usize, get(6) as usize, get(7) as usize);
     let (doc_height, band_top) = (get(8) as f32, get(9) as f32);
+    let run_count = get(10) as usize;
 
-    let mut at = 10;
+    let mut at = 11;
     let mut element_rects = Vec::with_capacity(rect_count);
     for i in 0..rect_count {
         let rect = zero_engine::ElementRect {
@@ -431,10 +444,22 @@ fn decode_frame(msg: Msg) -> Frame {
         });
         at += 4;
     }
+    let mut text_runs = Vec::with_capacity(run_count);
+    for i in 0..run_count {
+        text_runs.push(zero_engine::TextRun {
+            text: msg.str_at(1 + rect_count + link_count + i).to_string(),
+            x: get(at) as f32,
+            y: get(at + 1) as f32,
+            width: get(at + 2) as f32,
+            height: get(at + 3) as f32,
+        });
+        at += 4;
+    }
 
+    let words = rect_count + link_count + run_count;
     let submission = (get(at) != 0.0).then(|| zero_engine::Submission {
-        action: msg.str_at(1 + rect_count + link_count).to_string(),
-        query: msg.str_at(2 + rect_count + link_count).to_string(),
+        action: msg.str_at(1 + words).to_string(),
+        query: msg.str_at(2 + words).to_string(),
     });
     let click_handled = get(at + 1) != 0.0;
 
@@ -450,6 +475,7 @@ fn decode_frame(msg: Msg) -> Frame {
         element_rects,
         links,
         find_matches,
+        text_runs,
         click_handled,
         submission,
         pixels: msg.blob,
@@ -1126,6 +1152,7 @@ impl FakeRenderer {
             element_rects: page.element_rects,
             links: page.links,
             find_matches: page.find_matches,
+            text_runs: page.text_runs,
             submission: self.pending_submission.take(),
             click_handled: std::mem::take(&mut self.click_handled),
         }

@@ -43,6 +43,24 @@ pub struct TextFragment {
     pub font_index: usize,
 }
 
+/// One painted word, with the characters it stands for, in absolute page
+/// coordinates.
+///
+/// Shaping throws characters away ([`TextFragment`] keeps them only so
+/// find-in-page can match on them), and an embedder that wants to *select* text
+/// needs both halves back: where a word was drawn, and what it said. This is
+/// that pair, and nothing else — the glyphs stay in the engine.
+#[derive(Clone)]
+pub struct TextRun {
+    pub text: String,
+    pub x: f32,
+    /// Top of the line box, and how tall that line box is: a selection is
+    /// painted behind a whole line, not around the ink of the letters.
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 /// The painted area of an element, for hit-testing clicks against scripts.
 #[derive(Clone)]
 pub struct ElementRect {
@@ -2454,6 +2472,21 @@ pub fn collect_element_rects(bx: &LayoutBox, out: &mut Vec<ElementRect>) {
     }
     for child in &bx.children {
         collect_element_rects(child, out);
+    }
+}
+
+/// Gather every painted word from the laid-out tree, in document order —
+/// which is reading order, and so the order a selection runs through.
+pub fn collect_text_runs(bx: &LayoutBox, out: &mut Vec<TextRun>) {
+    out.extend(bx.text_fragments.iter().map(|f| TextRun {
+        text: f.text.clone(),
+        x: f.x,
+        y: f.y,
+        width: f.width,
+        height: f.line_height,
+    }));
+    for child in &bx.children {
+        collect_text_runs(child, out);
     }
 }
 
