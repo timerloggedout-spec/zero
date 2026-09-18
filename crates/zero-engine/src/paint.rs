@@ -319,8 +319,8 @@ impl Canvas {
     /// Positions come from the shaper, so scripts that reorder or stack marks land correctly.
     /// Uses the same font the shaper picked, so glyph ids resolve correctly.
     fn paint_text(&mut self, frag: &TextFragment, fonts: &FontSet) {
-        let font = match fonts.entries.get(frag.font_index) {
-            Some(entry) => entry.raster,
+        let font = match fonts.entries.get(frag.font_index).and_then(|entry| entry.raster()) {
+            Some(raster) => raster,
             None => return,
         };
         let ascent = font

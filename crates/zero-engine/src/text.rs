@@ -15,8 +15,20 @@
 /// One font, in both the views the engine needs: shaping and rasterizing.
 /// Both come from the same file so glyph ids agree.
 pub struct FontEntry<'a> {
-    pub raster: &'a fontdue::Font,
+    font: &'a crate::LoadedFont,
     pub shaper: &'a rustybuzz::Face<'a>,
+}
+
+impl<'a> FontEntry<'a> {
+    pub(crate) fn new(font: &'a crate::LoadedFont, shaper: &'a rustybuzz::Face<'a>) -> FontEntry<'a> {
+        FontEntry { font, shaper }
+    }
+
+    /// The rasterizer, parsed the first time it is asked for. `None` when the
+    /// file turned out not to be a font this can draw with.
+    pub fn raster(&self) -> Option<&'a fontdue::Font> {
+        self.font.raster()
+    }
 }
 
 /// Fonts in priority order; index 0 is the primary.
@@ -28,11 +40,17 @@ impl FontSet<'_> {
     /// Index of the first font that can draw every character of `text`,
     /// falling back to the primary font when none covers it fully.
     pub fn pick(&self, text: &str) -> usize {
+        // Coverage is asked of the *shaper*, which already has the font's
+        // character map open, rather than of the rasterizer, which would have to
+        // parse the whole font to answer. That matters because this walks the
+        // chain: a Devanagari word passes over the symbol font on its way to the
+        // Devanagari one, and parsing every font merely *considered* cost more
+        // than drawing the text. Now only a font that actually draws is parsed.
         self.entries
             .iter()
             .position(|e| {
                 text.chars()
-                    .all(|c| c.is_whitespace() || e.raster.lookup_glyph_index(c) != 0)
+                    .all(|c| c.is_whitespace() || e.shaper.glyph_index(c).is_some())
             })
             .unwrap_or(0)
     }

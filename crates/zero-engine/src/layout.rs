@@ -840,9 +840,9 @@ impl<'a> LayoutBox<'a> {
             // Inside an inline container, a block-level box can only be an
             // inline-block, so it joins the line as one indivisible item.
             if matches!(child.box_type, BoxType::BlockNode(_)) {
-                pieces.push(InlinePiece::Atomic(index));
+                pieces.push(InlinePiece::Atomic(vec![index]));
             } else {
-                collect_inline_text(child, default_size, None, &mut pieces);
+                collect_inline_text(child, default_size, None, &mut pieces, &[index]);
             }
         }
 
@@ -883,12 +883,11 @@ impl<'a> LayoutBox<'a> {
                     }
                     continue;
                 }
-                InlinePiece::Atomic(index) => {
-                    let index = *index;
+                InlinePiece::Atomic(path) => {
                     // Shrink-to-fit: an explicit width wins, else the content width,
                     // never wider than the line.
                     let outer = {
-                        let style = self.children[index].get_style_node();
+                        let style = descend(self, path).get_style_node();
                         let ctx = style.length_context(max_width);
                         match style.value("width") {
                             Some(v @ (Value::Length(..) | Value::Calc(..))) => {
@@ -924,8 +923,11 @@ impl<'a> LayoutBox<'a> {
                         width: outer,
                         height: 0.0,
                     };
-                    self.children[index].layout(slot, Some(fonts), images);
-                    let placed = self.children[index].dimensions.margin_box();
+                    let placed = {
+                        let box_at = descend(self, path);
+                        box_at.layout(slot, Some(fonts), images);
+                        box_at.dimensions.margin_box()
+                    };
                     line_height = line_height.max(placed.height);
                     for boxed in open.iter_mut() {
                         boxed.height = boxed.height.max(placed.height);
@@ -1467,9 +1469,19 @@ impl<'a> LayoutBox<'a> {
             .children
             .iter()
             .map(|child| match child.box_type {
+                // Text sitting directly in a flex row — `<div class=flex>Save
+                // <b>now</b></div>` — is a flex item like any other, and it is
+                // sized by what it says. Starting it at zero made it disappear
+                // whenever a sibling was willing to take the space.
                 BoxType::AnonymousBlock => Item {
-                    base: 0.0,
-                    grow: 1.0,
+                    base: child
+                        .children
+                        .iter()
+                        .filter(|inline| !matches!(inline.box_type, BoxType::AnonymousBlock))
+                        .map(|inline| max_content_width(inline.get_style_node(), fonts, images))
+                        .sum::<f32>()
+                        .min(container.width),
+                    grow: 0.0,
                     shrink: 1.0,
                 },
                 _ => {
@@ -1509,6 +1521,15 @@ impl<'a> LayoutBox<'a> {
             .value("align-items")
             .and_then(keyword_of)
             .unwrap_or_default();
+        // A row that states its own height is the box its items align inside.
+        // Measuring the tallest item instead centred a 38px toolbar row's icons
+        // within the 19px of text beside them, which reads as everything stuck
+        // to the top. Only for a single line: with several, the cross size is
+        // shared out, which is a different calculation.
+        let stated_height = style
+            .value("height")
+            .filter(|v| matches!(v, Value::Length(..) | Value::Calc(..)))
+            .map(|v| v.resolve(style.length_context(container.height)));
 
         // Group items into lines. Without wrapping everything shares one line.
         let flow: Vec<usize> = (0..count)
@@ -1614,6 +1635,10 @@ impl<'a> LayoutBox<'a> {
             // Cross-axis alignment happens once the line's height is known.
             // `align-self` on the item itself overrides the container's
             // `align-items` for just that one item.
+            let tallest = match (stated_height, lines.len()) {
+                (Some(stated), 1) => stated.max(tallest),
+                _ => tallest,
+            };
             for &i in line.iter() {
                 let own_align = match self.children[i].box_type {
                     BoxType::AnonymousBlock => None,
@@ -1751,9 +1776,11 @@ enum InlinePiece {
     Exit,
     /// A `<br>`: end this line here, whatever room is left on it.
     Break,
-    /// An `inline-block` child, laid out as a block but placed on the line.
-    /// Holds its index among this box's children.
-    Atomic(usize),
+    /// An `inline-block` descendant, laid out as a block but placed on the
+    /// line. Holds the path down to it from the box being laid out — a path
+    /// rather than an index because it can sit inside an inline element, as the
+    /// `<svg>` in `<a><svg/></a>` does.
+    Atomic(Vec<usize>),
 }
 
 /// A decorated inline element currently open on the line being built.
@@ -1787,6 +1814,7 @@ fn collect_inline_text(
     default_size: f32,
     href: Option<&str>,
     out: &mut Vec<InlinePiece>,
+    path: &[usize],
 ) {
     let mut current_href = href.map(str::to_string);
     let mut decorated = false;
@@ -1847,12 +1875,31 @@ fn collect_inline_text(
             }));
         }
     }
-    for child in &bx.children {
-        collect_inline_text(child, default_size, current_href.as_deref(), out);
+    for (index, child) in bx.children.iter().enumerate() {
+        let mut child_path = path.to_vec();
+        child_path.push(index);
+        // A block-level box this far in is an inline-block or a replaced element
+        // — an icon in a link, most often. It joins the line as one item rather
+        // than being walked for text it does not have; missing this case is what
+        // made `<a><svg/></a>` draw nothing at all.
+        if matches!(child.box_type, BoxType::BlockNode(_)) {
+            out.push(InlinePiece::Atomic(child_path));
+        } else {
+            collect_inline_text(child, default_size, current_href.as_deref(), out, &child_path);
+        }
     }
     if decorated {
         out.push(InlinePiece::Exit);
     }
+}
+
+/// The box a [`InlinePiece::Atomic`] path names, walking down from `root`.
+fn descend<'b, 'a>(root: &'b mut LayoutBox<'a>, path: &[usize]) -> &'b mut LayoutBox<'a> {
+    let mut box_at = root;
+    for step in path {
+        box_at = &mut box_at.children[*step];
+    }
+    box_at
 }
 
 /// The link target this node carries, whatever box it turned into.
@@ -1957,14 +2004,16 @@ fn align_cross_axis(
             slot.content = Rect {
                 x: outer.x,
                 y: line_top + shift,
-                width: child.dimensions.content.width
-                    + child.dimensions.padding.left
-                    + child.dimensions.padding.right,
+                // Laying the box out again has to hand it a containing block it
+                // will arrive back at the same width from, and `width: auto`
+                // takes the box's own edges off whatever it is given — so that
+                // is the outer width, not the content width. Passing the content
+                // width charged every padded item for its padding twice, which
+                // is how a centred icon ended up narrower than its own picture.
+                width: outer.width,
                 height: 0.0,
             };
             // Re-run layout so descendants move with the box.
-            let width = child.dimensions.content.width;
-            slot.content.width = width;
             child.layout(slot, fonts, images);
         }
         // `stretch` is the default: fill the line's height.
@@ -2259,12 +2308,20 @@ pub fn max_content_width(style: &StyledNode, fonts: Option<&FontSet>, images: &I
 
     let content = match style.node.node_type {
         NodeType::Text(ref t) => measure_text(t, style.font_size(), fonts),
-        NodeType::Element(ref e) if e.tag_name == "img" => e
-            .attributes
-            .get("src")
-            .and_then(|src| images.get(src))
-            .map(|img| img.width as f32)
-            .unwrap_or(0.0),
+        // An inline `<svg>` is a replaced element with a picture and a size, the
+        // same as an `<img>` — `replaced_size` already treats it as one. Missing
+        // it here measured every icon as an empty box, so an icon in a flex row
+        // or anything else shrink-to-fit was laid out as if it were not there.
+        NodeType::Element(ref e) if e.tag_name == "img" || e.tag_name == "svg" => {
+            let key = match e.tag_name.as_str() {
+                "svg" => Some(crate::inline_svg_key_of(e.node_id)),
+                _ => e.attributes.get("src").cloned(),
+            };
+            key.and_then(|src| images.get(&src).map(|img| img.width as f32))
+                // A picture that failed to load still reserves what it asked for.
+                .or_else(|| e.attributes.get("width").and_then(|w| w.trim().parse().ok()))
+                .unwrap_or(0.0)
+        }
         NodeType::Element(_) => {
             let row_flex = style.display() == Display::Flex
                 && !matches!(style.value("flex-direction"), Some(Value::Keyword(ref k)) if k == "column");
@@ -2487,6 +2544,15 @@ fn build_box<'a>(style_node: &'a StyledNode<'a>, force_block: bool) -> LayoutBox
             Display::None => {} // skip
             Display::Block | Display::Flex | Display::Grid | Display::Table => {
                 root.children.push(build_box(child, false))
+            }
+            // Text is the one thing that cannot be blockified: it has no block
+            // layout of its own, so a text node made into an item laid out as an
+            // empty box and painted nothing at all. CSS wraps it in an anonymous
+            // item instead, which is a box that *can* hold a line.
+            Display::Inline if blockifies && matches!(child.node.node_type, NodeType::Text(_)) => {
+                let mut item = LayoutBox::new(BoxType::AnonymousBlock);
+                item.children.push(build_box(child, false));
+                root.children.push(item);
             }
             Display::Inline if blockifies => root.children.push(build_box(child, true)),
             Display::Inline => root
@@ -3107,6 +3173,68 @@ mod tests {
             .map(|c| c.dimensions.content.width)
             .collect();
         assert_eq!(widths, vec![200.0, 0.0]);
+    }
+
+    #[test]
+    fn centring_a_flex_item_does_not_shrink_it() {
+        // A padded item in an `align-items: center` row is laid out twice: once
+        // for its width, once to move it down the line. The second pass has to
+        // arrive at the same width as the first, or the item quietly loses its
+        // padding's worth of room every time it is centred.
+        let node = dom::elem("div".into(), HashMap::new(), vec![]);
+        let mut padded = HashMap::new();
+        padded.insert("display".to_string(), Value::Keyword("block".into()));
+        padded.insert("padding-right".to_string(), Value::Length(9.0, Unit::Px));
+        let item = StyledNode {
+            node: &node,
+            specified_values: padded,
+            // Something inside, so the box has a height to be centred against.
+            children: vec![styled(&node, "block", Some(16.0), None, vec![])],
+        };
+        let mut row = HashMap::new();
+        row.insert("display".to_string(), Value::Keyword("flex".into()));
+        row.insert("align-items".to_string(), Value::Keyword("center".into()));
+        row.insert("height".to_string(), Value::Length(38.0, Unit::Px));
+        let root = StyledNode {
+            node: &node,
+            specified_values: row,
+            children: vec![item, styled(&node, "block", Some(40.0), None, vec![])],
+        };
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 200.0;
+
+        let laid = layout_tree(&root, viewport, None, &ImageMap::new());
+        let padded = &laid.children[0];
+        assert_eq!(padded.dimensions.content.width, 16.0);
+        // ...and what it holds keeps the room too.
+        assert_eq!(padded.children[0].dimensions.content.width, 16.0);
+    }
+
+    #[test]
+    fn bare_text_in_a_flex_row_does_not_swallow_the_row() {
+        // `<div class=flex>Search tabs<span>…</span></div>`: the text becomes an
+        // anonymous flex item. Letting it grow handed it every spare pixel, so
+        // the sized sibling beside it was squeezed out of the row entirely.
+        let node = dom::elem("div".into(), HashMap::new(), vec![]);
+        let words = dom::text("Search tabs".into());
+        let root = styled(
+            &node,
+            "flex",
+            None,
+            None,
+            vec![
+                styled(&words, "inline", None, None, vec![]),
+                styled(&node, "block", Some(200.0), None, vec![]),
+            ],
+        );
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 900.0;
+
+        let laid = layout_tree(&root, viewport, None, &ImageMap::new());
+        let sized = laid.children.last().expect("two items");
+        assert_eq!(sized.dimensions.content.width, 200.0);
+        // ...and it sits where the text leaves it, not pushed off the end.
+        assert!(sized.dimensions.content.x <= 200.0, "at x={}", sized.dimensions.content.x);
     }
 
     #[test]

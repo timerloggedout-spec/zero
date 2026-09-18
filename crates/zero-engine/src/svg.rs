@@ -77,7 +77,10 @@ pub fn rasterize(source: &str, width: usize, height: usize) -> Option<DecodedIma
         width * height
     ];
     let mut ctx = Ctx { canvas: &mut canvas, width, height, view };
-    let inherited = Paint::root();
+    // The root `<svg>` carries presentation attributes like any other element —
+    // `fill="none" stroke="…"` on the root is how icon sets state a line style
+    // once for every path inside. Skipping it filled every one of them black.
+    let inherited = Paint::root().with(elem);
     draw_children(svg, &mut ctx, inherited);
     Some(DecodedImage { width, height, pixels: canvas })
 }
@@ -434,13 +437,22 @@ fn flatten_path(d: &str) -> Vec<Vec<(f32, f32)>> {
                     cursor = end;
                 }
             }
-            // An elliptical arc is approximated by its chord: wrong, but a
-            // closed shape rather than a hole. ponytail: real arc flattening if
-            // a page needs it.
+            // `rx ry x-rotation large-arc sweep x y`. Icons are full of these —
+            // every rounded corner drawn as a path, every refresh swirl — so an
+            // arc is walked rather than cut across.
             'A' => {
                 for group in args.chunks_exact(7) {
-                    cursor = at(cursor, group[5], group[6]);
-                    current.push(cursor);
+                    let end = at(cursor, group[5], group[6]);
+                    flatten_arc(
+                        cursor,
+                        (group[0], group[1]),
+                        group[2],
+                        group[3] != 0.0,
+                        group[4] != 0.0,
+                        end,
+                        &mut current,
+                    );
+                    cursor = end;
                 }
                 last_control = None;
             }
@@ -479,6 +491,8 @@ fn path_commands(d: &str) -> Vec<(char, Vec<f32>)> {
     };
     for c in d.chars() {
         match c {
+            // `e` part-way through a number is an exponent, not the arc command.
+            'e' | 'E' if !number.is_empty() => number.push(c),
             'a'..='z' | 'A'..='Z' => {
                 flush(&mut number, &mut args);
                 if let Some(previous) = command.take() {
@@ -492,6 +506,14 @@ fn path_commands(d: &str) -> Vec<(char, Vec<f32>)> {
                 flush(&mut number, &mut args);
                 number.push(c);
             }
+            // So does a second point: `3.87.56` is two coordinates, which is how
+            // every tool that exports an icon writes them. Read as one number it
+            // parses as nothing, and dropping it shifts every pair after it —
+            // the path stays a path, but it is the wrong shape.
+            '.' if number.contains('.') => {
+                flush(&mut number, &mut args);
+                number.push(c);
+            }
             _ => number.push(c),
         }
     }
@@ -500,6 +522,73 @@ fn path_commands(d: &str) -> Vec<(char, Vec<f32>)> {
         out.push((previous, args));
     }
     out
+}
+
+/// An elliptical arc as line segments.
+///
+/// SVG states an arc by where it *ends* ("curve to here, bending like this"),
+/// but sampling one needs the centre it turns around. Recovering that centre is
+/// the spec's F.6.5, and it is the whole of the arithmetic below. The spec's own
+/// degenerate cases — a zero radius, or an arc ending where it began — are a
+/// straight line rather than an error.
+fn flatten_arc(
+    from: (f32, f32),
+    (rx, ry): (f32, f32),
+    rotation: f32,
+    large: bool,
+    sweep: bool,
+    to: (f32, f32),
+    out: &mut Vec<(f32, f32)>,
+) {
+    let (mut rx, mut ry) = (rx.abs(), ry.abs());
+    let degenerate = rx < f32::EPSILON
+        || ry < f32::EPSILON
+        || ((from.0 - to.0).abs() < f32::EPSILON && (from.1 - to.1).abs() < f32::EPSILON);
+    if degenerate {
+        out.push(to);
+        return;
+    }
+    let (sin, cos) = rotation.to_radians().sin_cos();
+    // Rotate the chord into the ellipse's own frame, where it is axis-aligned.
+    let (dx, dy) = ((from.0 - to.0) / 2.0, (from.1 - to.1) / 2.0);
+    let x1 = cos * dx + sin * dy;
+    let y1 = -sin * dx + cos * dy;
+    // Radii too small to reach across the chord are scaled up until they just do.
+    let lambda = x1 * x1 / (rx * rx) + y1 * y1 / (ry * ry);
+    if lambda > 1.0 {
+        rx *= lambda.sqrt();
+        ry *= lambda.sqrt();
+    }
+    // Of the two ellipses through both endpoints, the flags pick which centre.
+    let numerator = (rx * rx * ry * ry - rx * rx * y1 * y1 - ry * ry * x1 * x1).max(0.0);
+    let denominator = rx * rx * y1 * y1 + ry * ry * x1 * x1;
+    let mut scale = (numerator / denominator).sqrt();
+    if large == sweep {
+        scale = -scale;
+    }
+    let (cx1, cy1) = (scale * rx * y1 / ry, -scale * ry * x1 / rx);
+    let cx = cos * cx1 - sin * cy1 + (from.0 + to.0) / 2.0;
+    let cy = sin * cx1 + cos * cy1 + (from.1 + to.1) / 2.0;
+
+    let start = ((y1 - cy1) / ry).atan2((x1 - cx1) / rx);
+    let finish = ((-y1 - cy1) / ry).atan2((-x1 - cx1) / rx);
+    // `sweep` says which way round; without it the short way is not the one asked for.
+    let mut delta = finish - start;
+    if !sweep && delta > 0.0 {
+        delta -= std::f32::consts::TAU;
+    } else if sweep && delta < 0.0 {
+        delta += std::f32::consts::TAU;
+    }
+    // One segment per ~6°, the error budget `ellipse` already spends.
+    let steps = (delta.abs() / (std::f32::consts::TAU / 64.0)).ceil().max(1.0) as usize;
+    for step in 1..=steps {
+        let angle = start + delta * step as f32 / steps as f32;
+        let (s, c) = angle.sin_cos();
+        out.push((
+            cx + cos * rx * c - sin * ry * s,
+            cy + sin * rx * c + cos * ry * s,
+        ));
+    }
 }
 
 /// A cubic Bézier as line segments. 16 steps holds under half a pixel at icon
@@ -535,55 +624,105 @@ fn fill_and_stroke(ctx: &mut Ctx, subpaths: &[Vec<(f32, f32)>], paint: Paint) {
 /// Fill by the non-zero winding rule, sampling `SAMPLES`² points per pixel.
 fn fill(ctx: &mut Ctx, subpaths: &[Vec<(f32, f32)>], paint: Paint) {
     let Some(color) = paint.fill else { return };
-    // Every subpath is closed for filling, whether or not it said `Z`.
-    let edges: Vec<((f32, f32), (f32, f32))> = subpaths
+    let device: Vec<Vec<(f32, f32)>> = subpaths
         .iter()
-        .flat_map(|points| closed_edges(points))
-        .map(|(a, b)| (ctx.view.point(a), ctx.view.point(b)))
+        .map(|points| points.iter().map(|p| ctx.view.point(*p)).collect())
         .collect();
+    fill_device(ctx, &device, color, paint.opacity);
+}
+
+/// Fill polygons that are already in pixel coordinates.
+///
+/// Every polygon goes into one winding pass rather than being filled in turn. A
+/// stroke is a pile of overlapping quads and discs, and filling them one after
+/// another blends each one's soft edge over the last — which shows up as a dark
+/// seam down the middle of every thick line.
+///
+/// Each sub-scanline is solved once: find where the edges cross it, sort those
+/// crossings, and walk them to get the spans that are inside. Testing every edge
+/// at every pixel instead is the obvious way to write this and costs
+/// `pixels × edges` — which a stroked curve, being hundreds of small polygons,
+/// makes unaffordable at any size bigger than an icon.
+fn fill_device(ctx: &mut Ctx, polygons: &[Vec<(f32, f32)>], color: Color, opacity: f32) {
+    // Every polygon is closed for filling, whether or not it said `Z`.
+    let edges: Vec<((f32, f32), (f32, f32))> =
+        polygons.iter().flat_map(|points| closed_edges(points)).collect();
     if edges.is_empty() {
         return;
     }
     let (min_y, max_y) = vertical_span(&edges, ctx.height);
+    let (min_x, max_x) = horizontal_span(&edges, ctx.width);
+    if min_x >= max_x {
+        return;
+    }
+    // How many of a pixel's sample points were inside, for one row at a time.
+    let mut hits = vec![0u8; max_x - min_x];
+    let mut crossings: Vec<(f32, i32)> = Vec::new();
+    let step = 1.0 / SAMPLES as f32;
+
     for y in min_y..max_y {
-        for x in 0..ctx.width {
-            let mut hits = 0;
-            for sy in 0..SAMPLES {
-                let py = y as f32 + (sy as f32 + 0.5) / SAMPLES as f32;
-                let mut winding = [0i32; SAMPLES];
-                for (a, b) in &edges {
-                    if (a.1 <= py) == (b.1 <= py) {
-                        continue; // the edge does not cross this scanline
-                    }
-                    let t = (py - a.1) / (b.1 - a.1);
-                    let crossing = a.0 + t * (b.0 - a.0);
-                    let direction = if b.1 > a.1 { 1 } else { -1 };
-                    for (sx, count) in winding.iter_mut().enumerate() {
-                        let px = x as f32 + (sx as f32 + 0.5) / SAMPLES as f32;
-                        if crossing <= px {
-                            *count += direction;
+        hits.iter_mut().for_each(|h| *h = 0);
+        for sy in 0..SAMPLES {
+            let py = y as f32 + (sy as f32 + 0.5) * step;
+            crossings.clear();
+            for (a, b) in &edges {
+                if (a.1 <= py) == (b.1 <= py) {
+                    continue; // the edge does not cross this scanline
+                }
+                let t = (py - a.1) / (b.1 - a.1);
+                crossings.push((a.0 + t * (b.0 - a.0), if b.1 > a.1 { 1 } else { -1 }));
+            }
+            if crossings.len() < 2 {
+                continue;
+            }
+            crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+            // Between two crossings the winding number is constant, so the run
+            // between them is either wholly inside the shape or wholly outside.
+            let mut winding = 0;
+            for pair in 0..crossings.len() - 1 {
+                winding += crossings[pair].1;
+                if winding == 0 {
+                    continue;
+                }
+                let (from, to) = (crossings[pair].0, crossings[pair + 1].0);
+                let first = (from.floor().max(min_x as f32)) as usize;
+                let last = (to.ceil().min(max_x as f32)) as usize;
+                for x in first..last.min(max_x) {
+                    for sx in 0..SAMPLES {
+                        let px = x as f32 + (sx as f32 + 0.5) * step;
+                        // `from <= px` matches the winding this run stands for.
+                        if px >= from && px < to {
+                            hits[x - min_x] += 1;
                         }
                     }
                 }
-                hits += winding.iter().filter(|w| **w != 0).count();
             }
-            if hits > 0 {
-                let coverage = hits as f32 / (SAMPLES * SAMPLES) as f32;
-                blend(ctx, x, y, color, coverage * paint.opacity);
+        }
+        for (i, count) in hits.iter().enumerate() {
+            if *count > 0 {
+                let coverage = *count as f32 / (SAMPLES * SAMPLES) as f32;
+                blend(ctx, min_x + i, y, color, coverage * opacity);
             }
         }
     }
 }
 
-/// Stroke by filling a quad per segment: a rectangle as wide as the pen, with
-/// a square cap at each end.
+/// Stroke by laying a quad along every segment and a disc at every joint.
 ///
-/// ponytail: no joins, so a sharp corner has a small notch. At icon sizes it is
-/// invisible; a real stroker is the fix if it ever is not.
+/// The disc is what makes a corner a corner: without one, each segment ends
+/// square and the wedge between it and the next is simply missing, so a curve
+/// flattened into segments comes out serrated. A round joint is also the only
+/// one that needs no special case for how sharp the turn is.
+///
+/// ponytail: round joins and caps whatever `stroke-linejoin` and
+/// `stroke-linecap` say. At the sizes an icon or a logo is drawn, round and
+/// mitre differ by a fraction of a pixel — but no join at all is visible.
 fn stroke(ctx: &mut Ctx, subpaths: &[Vec<(f32, f32)>], paint: Paint) {
     let Some(color) = paint.stroke else { return };
     let width = (paint.stroke_width * ctx.view.scale).max(1.0);
     let half = width / 2.0;
+    let mut pieces: Vec<Vec<(f32, f32)>> = Vec::new();
     for points in subpaths {
         for pair in points.windows(2) {
             let (a, b) = (ctx.view.point(pair[0]), ctx.view.point(pair[1]));
@@ -592,48 +731,52 @@ fn stroke(ctx: &mut Ctx, subpaths: &[Vec<(f32, f32)>], paint: Paint) {
             if len < f32::EPSILON {
                 continue;
             }
-            // The pen's offset, perpendicular to the segment.
+            // The pen's offset, perpendicular to the segment. Rotating the
+            // direction the same way every time keeps every quad wound the same
+            // way, which is what lets them share one winding pass.
             let (nx, ny) = (-dy / len * half, dx / len * half);
-            let quad = vec![
+            pieces.push(vec![
                 (a.0 + nx, a.1 + ny),
                 (b.0 + nx, b.1 + ny),
                 (b.0 - nx, b.1 - ny),
                 (a.0 - nx, a.1 - ny),
-            ];
-            fill_device_polygon(ctx, &quad, color, paint.opacity);
+            ]);
+        }
+        // A pen one pixel wide has no joint worth filling.
+        if width > 2.0 && points.len() > 2 {
+            for vertex in &points[1..points.len() - 1] {
+                pieces.push(disc(ctx.view.point(*vertex), half));
+            }
         }
     }
+    fill_device(ctx, &pieces, color, paint.opacity);
 }
 
-/// Fill a polygon already in pixel coordinates (the stroker works there).
-fn fill_device_polygon(ctx: &mut Ctx, points: &[(f32, f32)], color: Color, opacity: f32) {
-    let edges: Vec<((f32, f32), (f32, f32))> = closed_edges(points);
-    let (min_y, max_y) = vertical_span(&edges, ctx.height);
-    for y in min_y..max_y {
-        for x in 0..ctx.width {
-            let mut hits = 0;
-            for sy in 0..SAMPLES {
-                let py = y as f32 + (sy as f32 + 0.5) / SAMPLES as f32;
-                for sx in 0..SAMPLES {
-                    let px = x as f32 + (sx as f32 + 0.5) / SAMPLES as f32;
-                    let mut winding = 0;
-                    for (a, b) in &edges {
-                        if (a.1 <= py) == (b.1 <= py) {
-                            continue;
-                        }
-                        let t = (py - a.1) / (b.1 - a.1);
-                        if a.0 + t * (b.0 - a.0) <= px {
-                            winding += if b.1 > a.1 { 1 } else { -1 };
-                        }
-                    }
-                    hits += (winding != 0) as usize;
-                }
-            }
-            if hits > 0 {
-                blend(ctx, x, y, color, hits as f32 / (SAMPLES * SAMPLES) as f32 * opacity);
-            }
-        }
+/// A circle as a polygon, wound the same way the stroke's quads are so the two
+/// add up rather than cancelling out. Sixteen sides is smooth at any width a
+/// joint is visible at.
+fn disc(centre: (f32, f32), radius: f32) -> Vec<(f32, f32)> {
+    const SIDES: usize = 16;
+    (0..=SIDES)
+        .map(|i| {
+            let angle = i as f32 / SIDES as f32 * std::f32::consts::TAU;
+            (centre.0 + radius * angle.cos(), centre.1 - radius * angle.sin())
+        })
+        .collect()
+}
+
+/// The columns a set of edges can possibly touch. Without this every fill
+/// walked the whole image width per scanline, which a stroke made of dozens of
+/// small quads pays for dozens of times over.
+fn horizontal_span(edges: &[((f32, f32), (f32, f32))], width: usize) -> (usize, usize) {
+    let (mut min, mut max) = (f32::MAX, f32::MIN);
+    for (a, b) in edges {
+        min = min.min(a.0).min(b.0);
+        max = max.max(a.0).max(b.0);
     }
+    let low = min.floor().max(0.0) as usize;
+    let high = (max.ceil() + 1.0).max(0.0) as usize;
+    (low.min(width), high.min(width))
 }
 
 fn closed_edges(points: &[(f32, f32)]) -> Vec<((f32, f32), (f32, f32))> {
@@ -720,6 +863,78 @@ mod tests {
         assert_eq!(at(&img, 20, 50), Color { r: 0, g: 0, b: 255, a: 255 });
         // ...and not the corner outside it.
         assert_eq!(at(&img, 95, 95).a, 0);
+    }
+
+    #[test]
+    fn compacted_path_numbers_are_read_as_separate_coordinates() {
+        // The same square three ways: spaced out, with the points run together
+        // the way an exporter writes them, and with an exponent in it.
+        let square = |d: &str| {
+            let img = rasterize(
+                &format!("<svg viewBox='0 0 10 10'><path fill='#ff0000' d='{d}'/></svg>"),
+                10,
+                10,
+            )
+            .expect("rasterized");
+            (at(&img, 5, 5).a, at(&img, 9, 9).a)
+        };
+        assert_eq!(square("M2.5 2.5L7.5 2.5L7.5 7.5L2.5 7.5z"), (255, 0));
+        assert_eq!(square("M2.5 2.5l5 0 0 5-5 0z"), (255, 0));
+        // `l5.0.0` is "5.0 then 0.0", not one unreadable number.
+        assert_eq!(square("M2.5 2.5l5.0.0.0 5-5 0z"), (255, 0));
+        assert_eq!(square("M2.5e0 2.5L7.5 2.5L7.5 7.5L2.5 7.5z"), (255, 0));
+    }
+
+    #[test]
+    fn an_arc_bulges_the_way_its_flags_ask() {
+        // The same two endpoints twice, differing only in `sweep`: one arc has
+        // to bulge up and the other down, or the flag is being ignored. Cutting
+        // straight across — which is what a chord approximation does — leaves
+        // both halves empty and fails either way.
+        let disc = |sweep: u8| {
+            rasterize(
+                &format!(
+                    "<svg viewBox='0 0 100 100'>\
+                     <path d='M10 50 A40 40 0 0 {sweep} 90 50 Z' fill='#ff0000'/></svg>"
+                ),
+                100,
+                100,
+            )
+            .expect("rasterized")
+        };
+        let up = disc(1);
+        assert_eq!(at(&up, 50, 20), Color { r: 255, g: 0, b: 0, a: 255 });
+        assert_eq!(at(&up, 50, 80).a, 0);
+
+        let down = disc(0);
+        assert_eq!(at(&down, 50, 80), Color { r: 255, g: 0, b: 0, a: 255 });
+        assert_eq!(at(&down, 50, 20).a, 0);
+
+        // A radius too small to span the endpoints is grown until it fits,
+        // rather than dropping the arc: r=10 cannot reach across 80 units.
+        let wide = rasterize(
+            "<svg viewBox='0 0 100 100'><path d='M10 50 A10 10 0 0 1 90 50 Z' fill='#ff0000'/></svg>",
+            100,
+            100,
+        )
+        .expect("rasterized");
+        assert_eq!(at(&wide, 50, 20), Color { r: 255, g: 0, b: 0, a: 255 });
+    }
+
+    #[test]
+    fn the_root_svg_states_a_line_style_for_everything_inside_it() {
+        // How every icon set writes it: the style is on the root, the paths
+        // carry only geometry.
+        let img = rasterize(
+            "<svg viewBox='0 0 20 20' fill='none' stroke='#ff0000' stroke-width='4'>\
+             <path d='M10 0V20'/></svg>",
+            20,
+            20,
+        )
+        .expect("rasterized");
+        assert_eq!(at(&img, 10, 10), Color { r: 255, g: 0, b: 0, a: 255 });
+        // `fill:none` from the root holds too, or the line would be a filled blob.
+        assert_eq!(at(&img, 2, 10).a, 0);
     }
 
     #[test]

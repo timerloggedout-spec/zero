@@ -562,9 +562,13 @@ impl Document {
 const USER_AGENT_CSS: &str = "
     html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, li, section, article,
     header, footer, nav, main, aside, figure, figcaption, blockquote, pre,
-    tr, form, fieldset, address, hr, img, input, textarea, button, select,
+    tr, form, fieldset, address, hr, input, textarea, button, select,
     label, tbody, thead, tfoot, center, dl, dt, dd, caption, details, summary,
     legend, menu, dir { display: block; }
+    /* A replaced element sits *on* a line of text, which is how a logo beside a
+       heading or an icon inside a link is written. As a block it took a line of
+       its own and pushed the words around it onto their own lines too. */
+    img { display: inline-block; }
     table { display: table; }
     pre { white-space: pre; }
     td, th { display: block; padding: 6px; }
@@ -599,10 +603,33 @@ const USER_AGENT_CSS: &str = "
     a { color: #0000ee; text-decoration: underline; }
 ";
 
-/// One loaded font: the rasterizer plus the raw bytes a shaping face is built from.
-struct LoadedFont {
-    raster: Font,
+/// One loaded font: the raw bytes a shaping face is built from, plus the
+/// rasterizer — built the first time something actually needs to draw with it.
+///
+/// Parsing is deferred because the fallback chain is mostly fonts a given page
+/// will never use. Reading all of them off disk costs milliseconds; *parsing*
+/// them costs over a second, and the CJK faces are nearly all of it. An embedder
+/// that starts a process per tab (as Zero's shell does) paid that on every new
+/// tab, for a page that was almost always Latin text.
+///
+/// [`FontSet::pick`](text::FontSet::pick) walks the chain in priority order and
+/// stops at the first font that covers the text, so an English page parses one
+/// font and a Japanese page parses the Japanese one when it meets it.
+pub(crate) struct LoadedFont {
     bytes: Vec<u8>,
+    raster: std::cell::OnceCell<Option<Font>>,
+}
+
+impl LoadedFont {
+    /// This font's rasterizer, parsed on first use. `None` if the bytes are not
+    /// a font this can read — which is as good as a font covering nothing.
+    pub(crate) fn raster(&self) -> Option<&Font> {
+        self.raster
+            .get_or_init(|| {
+                Font::from_bytes(self.bytes.as_slice(), fontdue::FontSettings::default()).ok()
+            })
+            .as_ref()
+    }
 }
 
 /// A rendering engine instance. Holds the fonts used for text; construct once, render many.
@@ -616,11 +643,15 @@ pub struct Engine {
 impl Engine {
     /// Build an engine that renders text using the given TrueType font bytes.
     pub fn new(font_bytes: &[u8]) -> Result<Engine, &'static str> {
+        // Parsed here and then kept, because this constructor's whole job is to
+        // report whether the bytes are a usable font.
         let raster = Font::from_bytes(font_bytes, fontdue::FontSettings::default())?;
+        let cell = std::cell::OnceCell::new();
+        let _ = cell.set(Some(raster));
         Ok(Engine {
             fonts: vec![LoadedFont {
-                raster,
                 bytes: font_bytes.to_vec(),
+                raster: cell,
             }],
         })
     }
@@ -628,15 +659,24 @@ impl Engine {
     /// Build an engine with a prioritized font fallback chain. Fonts that fail to
     /// parse are skipped; the first usable one is primary.
     pub fn with_fonts(fonts: Vec<Vec<u8>>) -> Engine {
+        // Nothing is parsed here: a font is read when a page first needs it.
+        // See [`LoadedFont`] for why that matters more than it sounds.
         let fonts = fonts
             .into_iter()
-            .filter_map(|bytes| {
-                Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default())
-                    .ok()
-                    .map(|raster| LoadedFont { raster, bytes })
-            })
+            .map(|bytes| LoadedFont { bytes, raster: std::cell::OnceCell::new() })
             .collect();
         Engine { fonts }
+    }
+
+    /// Parse the primary font now rather than when the first page asks for it.
+    ///
+    /// An embedder that starts a renderer ahead of time has idle milliseconds to
+    /// spend on this; the tab it will eventually draw does not. Every other font
+    /// in the chain stays unparsed until something actually needs that script.
+    pub fn warm(&self) {
+        if let Some(font) = self.fonts.first() {
+            let _ = font.raster();
+        }
     }
 
     /// Build an engine with no font: boxes/colors render, text is skipped.
@@ -744,12 +784,7 @@ impl Engine {
             .fonts
             .iter()
             .zip(faces.iter())
-            .filter_map(|(f, face)| {
-                face.as_ref().map(|shaper| FontEntry {
-                    raster: &f.raster,
-                    shaper,
-                })
-            })
+            .filter_map(|(f, face)| face.as_ref().map(|shaper| FontEntry::new(f, shaper)))
             .collect();
         let fonts = if entries.is_empty() {
             None
@@ -1250,6 +1285,18 @@ mod tests {
         let mut ids = Vec::new();
         ids_of(&doc.root, "input", &mut ids);
         ids[0]
+    }
+
+    #[test]
+    fn a_font_that_cannot_be_read_is_skipped_rather_than_drawn_with() {
+        // Fonts are parsed the first time something draws with them, so an
+        // unreadable one is not noticed at load: every path that reaches for a
+        // rasterizer has to cope with not getting one.
+        let engine = super::Engine::with_fonts(vec![b"not a font at all".to_vec()]);
+        let canvas = engine.render("<html><body>hello</body></html>", "", 80.0, 40.0);
+        assert_eq!(canvas.width, 80);
+        // Nothing could be drawn with it, so the page is blank rather than a panic.
+        assert!(canvas.pixels.iter().all(|p| p.r == 255 && p.g == 255 && p.b == 255));
     }
 
     #[test]
