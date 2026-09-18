@@ -1,7 +1,7 @@
 # Zero Browser — Roadmap & Risk Register
 
-**Version:** 0.2
-**Last updated:** 2026-07-22
+**Version:** 0.3
+**Last updated:** 2026-09-18
 
 > **Where it stands.** Phases 0 and 1 are done except for the multi-process
 > shell, and most of Phase 2 landed with them: flexbox, grid, floats, `overflow`
@@ -14,11 +14,11 @@
 > **What is genuinely not built, and why it is not a matter of polish:**
 >
 > * **Multi-process + sandbox (R5).** Partly built. Startup mitigations apply to
->   every process, and the headless render path runs page content in a separate,
->   privilege-dropped renderer with no network of its own. **Interactive tabs
->   still render in-process**: every click, keystroke and hover has to cross the
->   same pipe, and that protocol is the next increment. Site isolation and a
->   filesystem jail (restricted token / AppContainer) come after it.
+>   every process, and page content renders in a separate, privilege-dropped
+>   renderer with no network of its own — interactive tabs included: every tab
+>   gets one, and the shell keeps a spare already warmed so opening a tab does
+>   not wait for a process. Site isolation (renderer per *site*, not per tab) and
+>   a filesystem jail (restricted token / AppContainer) are what is left.
 > * **GPU compositing.** Measured, on a real page at 1280x900: 25 ms to render
 >   the page, 1.5 ms to composite the frame. Presenting that same CPU-rastered
 >   frame through the GPU competes for the 1.5 ms and cannot touch the 25 ms —
@@ -36,10 +36,16 @@
 >   without a second engine to ship, sandbox and keep current. If that proves
 >   insufficient in use, the bridge is the answer; until then it is 200 MB of
 >   speculation.
-> * **CSS transitions.** Deliberately not animated: the engine renders the
->   settled state, which is the state that matters for reading a page. Animating
->   needs a clock and per-element previous values — state the renderer does not
->   otherwise keep.
+> * **CSS transitions.** Now animated: `anim.rs` keeps the previous value per
+>   element and the document carries a clock. The chrome does not use them — it
+>   is rebuilt from scratch each frame, so there is no previous value to
+>   interpolate from — but a page's own transitions run.
+>
+> **What is next is tracked as milestones**, not phases: the phases below are the
+> strategy, and the milestones are the ordered work. They were set by opening
+> real sites and writing down what broke, so they lead with the things that make
+> Zero unusable rather than the things that are furthest from spec.
+> See <https://github.com/vedantnimbarte/zero/milestones>.
 
 > This roadmap is deliberately honest about the biggest fact of the project: a
 > from-scratch browser engine is a multi-year effort. The plan front-loads
