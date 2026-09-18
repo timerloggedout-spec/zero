@@ -117,6 +117,12 @@ const HINDI: &[(&str, &str)] = &[
     ("Hidden", "छिपी"),
     ("Dark", "गहरा"),
     ("Light", "हल्का"),
+    ("This page could not be drawn", "यह पृष्ठ नहीं बनाया जा सका"),
+    (
+        "The renderer stopped before it finished this page. Your other tabs are unaffected.",
+        "यह पृष्ठ बनाते समय रेंडरर रुक गया। आपके बाकी टैब सुरक्षित हैं।",
+    ),
+    ("Press Ctrl+R to try again.", "फिर से कोशिश करने के लिए Ctrl+R दबाएँ।"),
     ("Search tabs", "टैब खोजें"),
     ("No tab matches that.", "उससे कोई टैब मेल नहीं खाता।"),
     ("Recently visited", "हाल ही में देखे गए"),

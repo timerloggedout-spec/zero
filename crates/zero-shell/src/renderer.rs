@@ -117,11 +117,23 @@ struct Session {
     /// (focus, then a handler) beats a link underneath it, exactly as it did
     /// when `app.rs` made that decision itself from `doc.click()`'s return.
     click_handled: bool,
+    /// The first document row the parent wants painted, or `None` for the page
+    /// whole. A browser shows one screenful, and painting and shipping the whole
+    /// of a long article is what made a long page cost tens of megabytes a
+    /// frame — but a headless screenshot genuinely does want all of it.
+    band: Option<f32>,
     /// This process's own clock, so CSS transitions have one to animate
     /// against without `app.rs` having to thread a timestamp through every
     /// message — a renderer that outlives one request can just watch its own
     /// wall clock instead.
     created: std::time::Instant,
+}
+
+/// Which band a request is asking for. A negative row means "the page whole",
+/// which is how a headless render asks for every pixel of a long document.
+fn band_of(request: &Msg) -> Option<f32> {
+    let top = request.num_at(2) as f32;
+    (top >= 0.0).then_some(top)
 }
 
 impl Session {
@@ -149,6 +161,7 @@ impl Session {
             doc,
             width: request.num_at(0) as f32,
             height: request.num_at(1) as f32,
+            band: band_of(request),
             pending_submission: None,
             click_handled: false,
             created: std::time::Instant::now(),
@@ -187,9 +200,12 @@ impl Session {
             "backspace" => {
                 self.doc.backspace();
             }
+            // Doubles as "scrolled": the parent asks for the band it needs and
+            // gets it back painted, whether or not the size changed.
             "resize" => {
                 self.width = request.num_at(0) as f32;
                 self.height = request.num_at(1) as f32;
+                self.band = band_of(request);
             }
             "find" => {
                 let query = request.str_at(0);
@@ -227,7 +243,8 @@ impl Session {
 fn write_frame(engine: &Engine, session: &mut Session, output: &mut std::io::Stdout) {
     session.doc.set_time(session.created.elapsed().as_secs_f32() * 1000.0);
     let loader = PipeLoader;
-    let page = engine.render_document(&mut session.doc, session.width, session.height, &loader);
+    let band = session.band.map(|top| (top, session.height));
+    let page = engine.render_band(&mut session.doc, session.width, session.height, band, &loader);
 
     let mut pixels = Vec::with_capacity(page.canvas.pixels.len() * 4);
     for p in &page.canvas.pixels {
@@ -243,7 +260,12 @@ fn write_frame(engine: &Engine, session: &mut Session, output: &mut std::io::Std
         .num(session.doc.is_focused() as u8 as f64)
         .num(page.element_rects.len() as f64)
         .num(page.links.len() as f64)
-        .num(page.find_matches.len() as f64);
+        .num(page.find_matches.len() as f64)
+        // How long the whole page is, and which row of it this band starts at:
+        // the canvas is one screenful, and the scrollbar has to size itself
+        // against the document rather than against what was painted.
+        .num(page.doc_height as f64)
+        .num(page.band_top as f64);
     for r in &page.element_rects {
         answer = answer.num(r.node_id as f64).num(r.x as f64).num(r.y as f64);
         answer = answer.num(r.width as f64).num(r.height as f64);
@@ -344,8 +366,12 @@ pub struct Frame {
     pub title: String,
     pub width: usize,
     pub height: usize,
-    /// RGBA, row-major.
+    /// RGBA, row-major. One band of the page, not the whole of it.
     pub pixels: Vec<u8>,
+    /// The full height of the page this band came from.
+    pub doc_height: f32,
+    /// The first document row this band stands for.
+    pub band_top: f32,
     pub uses_hover: bool,
     pub animating: bool,
     pub is_focused: bool,
@@ -367,8 +393,9 @@ fn decode_frame(msg: Msg) -> Frame {
     let get = |i: usize| msg.num_at(i);
     let (width, height) = (get(0) as usize, get(1) as usize);
     let (rect_count, link_count, match_count) = (get(5) as usize, get(6) as usize, get(7) as usize);
+    let (doc_height, band_top) = (get(8) as f32, get(9) as f32);
 
-    let mut at = 8;
+    let mut at = 10;
     let mut element_rects = Vec::with_capacity(rect_count);
     for i in 0..rect_count {
         let rect = zero_engine::ElementRect {
@@ -415,6 +442,8 @@ fn decode_frame(msg: Msg) -> Frame {
         title: msg.str_at(0).to_string(),
         width,
         height,
+        doc_height,
+        band_top,
         uses_hover: get(2) != 0.0,
         animating: get(3) != 0.0,
         is_focused: get(4) != 0.0,
@@ -628,7 +657,9 @@ pub fn render_in_child(
         .text(css)
         .text(find.unwrap_or(""))
         .num(width as f64)
-        .num(height as f64);
+        .num(height as f64)
+        // A screenshot is the one caller that wants every row of a long page.
+        .num(-1.0);
     // No `store`: a one-shot headless render has no site to persist to.
     let frame = round_trip(&mut to_child, &mut from_child, &request, loader, None);
 
@@ -770,7 +801,8 @@ impl TabRenderer {
             .text(css)
             .text("")
             .num(width as f64)
-            .num(height as f64);
+            .num(height as f64)
+            .num(0.0);
         self.exchange(request)
     }
 
@@ -811,8 +843,15 @@ impl TabRenderer {
         self.send(Msg::new("backspace"))
     }
 
-    pub fn resize(&mut self, width: f32, height: f32) -> Option<Frame> {
-        self.send(Msg::new("resize").num(width as f64).num(height as f64))
+    /// Ask for the band starting at `band_top`, `height` rows tall. Doubles as
+    /// "the window changed size" and as "the page scrolled".
+    pub fn resize(&mut self, width: f32, height: f32, band_top: f32) -> Option<Frame> {
+        self.send(
+            Msg::new("resize")
+                .num(width as f64)
+                .num(height as f64)
+                .num(band_top as f64),
+        )
     }
 
     pub fn find(&mut self, query: Option<&str>) -> Option<Frame> {
@@ -957,6 +996,7 @@ pub struct FakeRenderer {
     loader: std::rc::Rc<dyn ResourceLoader>,
     width: f32,
     height: f32,
+    band_top: f32,
     pending_submission: Option<zero_engine::Submission>,
     click_handled: bool,
 }
@@ -978,6 +1018,7 @@ impl FakeRenderer {
             loader,
             width,
             height,
+            band_top: 0.0,
             pending_submission: None,
             click_handled: false,
         };
@@ -1034,9 +1075,10 @@ impl FakeRenderer {
         Some(self.snapshot())
     }
 
-    pub fn resize(&mut self, width: f32, height: f32) -> Option<Frame> {
+    pub fn resize(&mut self, width: f32, height: f32, band_top: f32) -> Option<Frame> {
         self.width = width;
         self.height = height;
+        self.band_top = band_top;
         Some(self.snapshot())
     }
 
@@ -1064,7 +1106,9 @@ impl FakeRenderer {
     /// `decode_frame` builds from the wire — no bytes cross a pipe here, but
     /// every field means the same thing either way.
     fn snapshot(&mut self) -> Frame {
-        let page = self.engine.render_document(&mut self.doc, self.width, self.height, self.loader.as_ref());
+        let band = Some((self.band_top, self.height));
+        let page =
+            self.engine.render_band(&mut self.doc, self.width, self.height, band, self.loader.as_ref());
         let mut pixels = Vec::with_capacity(page.canvas.pixels.len() * 4);
         for p in &page.canvas.pixels {
             pixels.extend_from_slice(&[p.r, p.g, p.b, p.a]);
@@ -1073,6 +1117,8 @@ impl FakeRenderer {
             title: self.doc.title(),
             width: page.canvas.width,
             height: page.canvas.height,
+            doc_height: page.doc_height,
+            band_top: page.band_top,
             pixels,
             uses_hover: page.uses_hover,
             animating: page.animating,

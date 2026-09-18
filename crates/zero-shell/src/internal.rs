@@ -111,6 +111,26 @@ fn wrap(title: &str, body: &str) -> String {
     )
 }
 
+/// The page shown when a page arrived but could not be drawn.
+///
+/// The renderer is a separate process, and one that stops — killed, out of
+/// memory, handed something it could not finish — must cost its own tab and
+/// nothing else. The tab keeps its address so reloading is one keystroke, and
+/// says plainly what happened: a blank tab that explains nothing is worse than
+/// either the page or the error.
+pub fn render_failed_page(url: &str) -> String {
+    format!(
+        "<html><head><title>{title}</title>{style}</head><body>         <h1>{title}</h1>         <div class=\"lede\">{lede}</div>         <div class=\"empty\">{}</div>         <div class=\"hint\">{hint}</div>         </body></html>",
+        escape(url),
+        style = page_style(),
+        title = escape(&t("This page could not be drawn")),
+        lede = escape(&t(
+            "The renderer stopped before it finished this page. Your other tabs are unaffected."
+        )),
+        hint = escape(&t("Press Ctrl+R to try again.")),
+    )
+}
+
 /// The page's own markup, as Zero received it.
 ///
 /// Lines become separate blocks and leading spaces become non-breaking ones:

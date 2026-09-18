@@ -32,7 +32,7 @@ mod sync;
 mod wire;
 
 use ai::Assistant;
-use net::{is_url, load_target, ShellLoader};
+use net::{is_url, load_target, local_page, ShellLoader};
 use std::fs;
 
 fn main() {
@@ -110,20 +110,29 @@ fn main() {
     let (html, css, address) = match args.next() {
         None => {
             restore_session = true;
-            let html = fs::read_to_string("examples/test.html").expect("read html");
-            let css = fs::read_to_string("examples/test.css").expect("read css");
-            (html, css, "examples/test.html".to_string())
+            // The demo page when it is there — running from the repo — and the
+            // start page when it is not, rather than refusing to open at all.
+            match fs::read_to_string("examples/test.html") {
+                Ok(html) => {
+                    let css = fs::read_to_string("examples/test.css").unwrap_or_default();
+                    (html, css, "examples/test.html".to_string())
+                }
+                Err(_) => {
+                    let start = "zero://newtab".to_string();
+                    (internal::page(&start), String::new(), start)
+                }
+            }
         }
         Some(target) if is_url(&target) || internal::is_internal(&target) => {
             let fetched = load_target(&target);
             (fetched.body, String::new(), fetched.url)
         }
         Some(target) => {
-            let html = fs::read_to_string(&target).expect("could not read HTML file");
+            let html = local_page(&target);
             // A following `*.css` arg is an explicit stylesheet; otherwise rely on
             // the page's own <style>. (Anything else is left for the PNG out path.)
             let css = if args.peek().map(|a| a.ends_with(".css")).unwrap_or(false) {
-                fs::read_to_string(args.next().unwrap()).expect("read css")
+                fs::read_to_string(args.next().unwrap()).unwrap_or_default()
             } else {
                 String::new()
             };

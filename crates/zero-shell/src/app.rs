@@ -59,6 +59,15 @@ const SCROLLBAR_W: u32 = 12;
 /// the next frame regardless, since `cache_w`/`cache_h` start unset.
 const DEFAULT_VIEWPORT: (f32, f32) = (800.0, 600.0);
 const MENU_W: u32 = 274;
+/// How much page is painted above and below the visible one, as a fraction of
+/// the window, so small scrolls move within what the renderer already sent
+/// instead of asking for more.
+///
+/// Half a screen each way absorbs several wheel notches before a round trip,
+/// and keeps a band at twice the window — which is what bounds a frame. Raising
+/// it buys smoother scrolling and costs pixels in every frame, including on a
+/// display far larger than the one this was tuned on.
+pub const BAND_MARGIN: f32 = 0.5;
 /// The page lies on the window as a card rather than filling a hole in it: this
 /// much window shows past its right and bottom edges, and its corners are
 /// rounded by [`PAGE_RADIUS`]. Straight from the site, whose `.page` is the same
@@ -795,6 +804,10 @@ struct Tab {
     loader: Rc<ShellLoader>,
     cache_w: u32,
     cache_h: u32,
+    /// The first document row `page_canvas` holds, and the height of the whole
+    /// page it came out of — the canvas is one band, not the document.
+    band_top: f32,
+    doc_height: f32,
 }
 
 /// A tab's own `localStorage`, partitioned by site like cookies — shared by
@@ -830,16 +843,30 @@ fn canvas_from_frame(frame: &renderer::Frame) -> Canvas {
 impl Tab {
     fn new(address: String, html: String, css: String) -> Tab {
         let loader = Rc::new(ShellLoader::new(address.clone()));
-        let source = html.clone();
-        let (renderer, frame) = TabRenderer::spawn(
-            &html,
-            &css,
-            DEFAULT_VIEWPORT.0,
-            DEFAULT_VIEWPORT.1,
-            loader.clone(),
-            store_for(&address),
-        )
-        .expect("spawn the tab's renderer process");
+        let draw = |html: &str, css: &str| {
+            TabRenderer::spawn(
+                html,
+                css,
+                DEFAULT_VIEWPORT.0,
+                DEFAULT_VIEWPORT.1,
+                loader.clone(),
+                store_for(&address),
+            )
+        };
+        // A page the renderer cannot draw costs this tab, not the window: the
+        // tab says so instead, and reloading is one keystroke away. Only a
+        // renderer that cannot draw even that is fatal — at which point the
+        // browser cannot show anything at all, and saying so beats a window
+        // full of blank tabs.
+        let (source, (renderer, frame)) = match draw(&html, &css) {
+            Some(drawn) => (html, drawn),
+            None => {
+                let failed = crate::internal::render_failed_page(&address);
+                let drawn = draw(&failed, "")
+                    .expect("the renderer could not draw even the page explaining itself");
+                (failed, drawn)
+            }
+        };
         let mut tab = Tab {
             loader,
             history: vec![address.clone()],
@@ -862,6 +889,8 @@ impl Tab {
             source,
             cache_w: 0,
             cache_h: 0,
+            band_top: 0.0,
+            doc_height: 0.0,
         };
         // `cache_w`/`cache_h` stay 0, so the first real `render_pane` call —
         // at the window's actual size, not this placeholder one — still
@@ -889,6 +918,8 @@ impl Tab {
         self.links = frame.links.clone();
         self.matches = frame.find_matches.clone();
         self.page_canvas = Some(canvas_from_frame(&frame));
+        self.band_top = frame.band_top;
+        self.doc_height = frame.doc_height;
         self.cache_w = w;
         self.cache_h = h;
     }
@@ -898,14 +929,29 @@ impl Tab {
     /// running scripts), which a crashed process has no way to hand over,
     /// but the same navigation, retried silently instead of leaving the tab
     /// permanently blank after one hung script.
-    fn respawn(&mut self, w: f32, h: f32) -> Option<renderer::Frame> {
+    fn respawn(&mut self, w: f32, h: f32, band_top: f32) -> Option<renderer::Frame> {
         if self.source.is_empty() {
             return None; // nothing loaded yet to reload
         }
-        let (renderer, frame) =
+        let (mut renderer, frame) =
             TabRenderer::spawn(&self.source, "", w, h, self.loader.clone(), store_for(&self.address))?;
+        // A fresh renderer starts at the top of the page; this tab may not be.
+        let frame = match band_top > 0.0 {
+            true => renderer.resize(w, h, band_top).unwrap_or(frame),
+            false => frame,
+        };
         self.renderer = renderer;
         Some(frame)
+    }
+
+    /// Whether the band this tab is holding covers `height` rows from `top`.
+    fn band_covers(&self, top: f32, height: f32) -> bool {
+        let Some(canvas) = self.page_canvas.as_ref() else { return false };
+        let held = canvas.height as f32;
+        // The bottom of the page is covered by a band that reaches the end of
+        // the document, even when it is shorter than a screenful.
+        let reaches_end = self.band_top + held >= self.doc_height - 0.5;
+        top >= self.band_top && (top + height <= self.band_top + held || reaches_end)
     }
 
     /// How the tab names itself in a space `max` characters wide.
@@ -952,6 +998,9 @@ pub fn screenshot(
                 app.run_assistant();
             }
             ("hover", id) => app.hovered = Some(id.to_string()),
+            // Down the page, so a long article can be reviewed past its first
+            // screenful — which is also the only way to see a band boundary.
+            ("scroll", px) => app.tab_mut().scroll_y = px.parse().unwrap_or(0.0),
             ("railpx", _) => {} // applied after the loop, once settings are known
             ("search", query) => app.focus = Focus::TabSearch(query.to_string()),
             ("find", query) => {
@@ -1928,9 +1977,32 @@ impl App {
                 tab.renderer = renderer; // dropping the old one kills its process
                 frame
             }),
-        }
-        .expect("the tab's renderer could not draw the page");
-        tab.source = fetched.body;
+        };
+        // The same rule as opening a tab: a page that cannot be drawn costs this
+        // tab, not the window. The address stays, so Ctrl+R retries it.
+        let (frame, body) = match frame {
+            Some(frame) => (frame, fetched.body),
+            None => {
+                let failed = crate::internal::render_failed_page(&tab.address);
+                match TabRenderer::spawn(
+                    &failed,
+                    "",
+                    w,
+                    h,
+                    tab.loader.clone(),
+                    store_for(&tab.address),
+                ) {
+                    Some((renderer, frame)) => {
+                        tab.renderer = renderer;
+                        (frame, failed)
+                    }
+                    // Not even that could be drawn: leave the tab showing what
+                    // it already had rather than blanking it.
+                    None => return,
+                }
+            }
+        };
+        tab.source = body;
         tab.matches.clear();
         tab.scroll_y = 0.0;
         tab.apply_frame(frame, w as u32, h as u32);
@@ -2172,7 +2244,7 @@ impl App {
         let top = regions.content_y as f32;
         let viewport = regions.content_h as f32;
         let tab = self.tab_mut();
-        let content = tab.page_canvas.as_ref().map_or(0.0, |c| c.height as f32) * tab.zoom_factor();
+        let content = tab.doc_height * tab.zoom_factor();
         tab.scroll_y = scroll_for_cursor(content, viewport, y - top);
     }
 
@@ -2750,10 +2822,12 @@ impl App {
     /// when nothing about the page or the space it has changed.
     fn render_pane(&mut self, index: usize, w: f32, h: f32) {
         let animating = self.page_animating;
+        let visible = self.tabs[index].scroll_y / self.tabs[index].zoom_factor();
         let tab = &mut self.tabs[index];
         let settled = tab.page_canvas.is_some()
             && tab.cache_w == w as u32
             && tab.cache_h == h as u32
+            && tab.band_covers(visible, h)
             && !animating
             // A renderer found dead by some other call (a click, typing, ...)
             // must not stay "settled" on its last good frame forever — this
@@ -2775,7 +2849,14 @@ impl App {
         // matter which interaction found the renderer dead, so it is the
         // natural place to notice and recover rather than every call site
         // trying to.
-        let frame = if tab.renderer.is_dead() { tab.respawn(w, h) } else { tab.renderer.resize(w, h) };
+        // The band to ask for: what is on screen, with a screenful of slack each
+        // way so scrolling moves inside it rather than through the pipe.
+        let band_top = (visible - h * BAND_MARGIN).max(0.0);
+        let band_height = h * (1.0 + 2.0 * BAND_MARGIN);
+        let frame = match tab.renderer.is_dead() {
+            true => tab.respawn(w, band_height, band_top),
+            false => tab.renderer.resize(w, band_height, band_top),
+        };
         let Some(frame) = frame else { return };
         if timing_wanted() {
             eprintln!("page render {:?}", render_start.elapsed());
@@ -2878,13 +2959,19 @@ impl App {
             // The last layout is slid instead, and reflows once the rail lands —
             // which is what every other browser does with an animating panel.
             let tab = &self.tabs[self.active];
-            let stale = tab.cache_w != layout_w as u32 || tab.cache_h != layout_h as u32;
+            let resized = tab.cache_w != layout_w as u32 || tab.cache_h != layout_h as u32;
+            // Scrolling off the end of the band the renderer sent is the other
+            // way a frame goes stale: the pixels for where we are looking now
+            // were never painted, so they have to be asked for.
+            let scrolled_out = !tab.band_covers(tab.scroll_y / zoom, layout_h);
+            let stale = resized || scrolled_out;
             if tab.page_canvas.is_none() || self.page_animating || (stale && !self.animating) {
                 self.render_pane(self.active, layout_w, layout_h);
             }
             let tab = &mut self.tabs[self.active];
-            // Clamp scroll to available overflow, in screen pixels.
-            let content = tab.page_canvas.as_ref().expect("just rendered").height as f32 * zoom;
+            // Clamp scroll to available overflow, in screen pixels. The whole
+            // document's height, not the band's — the band is one screenful.
+            let content = tab.doc_height * zoom;
             let max_scroll = (content - regions.content_h as f32).max(0.0);
             tab.scroll_y = tab.scroll_y.clamp(0.0, max_scroll);
         }
@@ -2987,6 +3074,7 @@ impl App {
             (regions.content_x, regions.content_y, regions.content_w, regions.content_h),
             scroll,
             zoom,
+            self.tabs[self.active].band_top,
         );
         // The other pane, drawn the same way the focused one just was.
         if regions.other_w > 0 {
@@ -3008,6 +3096,7 @@ impl App {
                         ),
                         scroll,
                         zoom,
+                        tab.band_top,
                     );
                 }
             }
@@ -3027,7 +3116,7 @@ impl App {
 
         // Scrollbar: a track down the right edge of the page, with a thumb sized
         // to the visible fraction. Only shown when the page actually overflows.
-        let content_h = page.height as f32 * zoom;
+        let content_h = self.tabs[self.active].doc_height * zoom;
         if let Some((offset, thumb_h)) =
             scrollbar_thumb(content_h, regions.content_h as f32, scroll)
         {
@@ -3192,13 +3281,19 @@ fn blit_page(
     (x0, y0, pane_w, pane_h): (u32, u32, u32, u32),
     scroll: f32,
     zoom: f32,
+    band_top: f32,
 ) {
     let inv_zoom = 1.0 / zoom;
     let right = (x0 + pane_w).min(w);
     let bottom = (y0 + pane_h).min(h);
     for y in y0..bottom {
-        let sy = ((y - y0) as f32 + scroll) * inv_zoom;
-        let sy = (sy as usize).min(page.height.saturating_sub(1));
+        // Window row -> document row -> row of the band actually held.
+        let document_row = ((y - y0) as f32 + scroll) * inv_zoom;
+        let sy = document_row - band_top;
+        if sy < 0.0 || sy as usize >= page.height {
+            continue; // outside the band: leave the window's own surface showing
+        }
+        let sy = sy as usize;
         let row = sy * page.width;
         // Unzoomed, a row of the page is a row of the window: the per-pixel
         // coordinate arithmetic is the same answer as walking forwards, and it

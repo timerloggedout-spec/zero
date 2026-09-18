@@ -11,9 +11,19 @@
 
 use std::io::{Read, Write};
 
-/// The largest frame either side will accept. A 4K window's pixels are ~33 MB,
-/// so the ceiling has to clear that and nothing more.
-const MAX_FRAME: usize = 64 * 1024 * 1024;
+/// The largest frame either side will accept.
+///
+/// A frame is one band of a page — the window plus [`crate::app::BAND_MARGIN`]
+/// each way — so what bounds this is the size of the *window*, not the length of
+/// the document. Twice a 4K window's pixels is ~66 MB, and the ceiling clears
+/// that with room to spare and nothing more: it exists so a renderer handling a
+/// hostile page cannot make this process allocate without limit.
+///
+/// It used to be reasoned from a single 4K window, on the assumption that a
+/// frame was one screenful. It was not — the canvas grew to the whole document
+/// — so any article longer than about 12,000 px was refused here, and the tab
+/// that asked for it took the browser down with it.
+const MAX_FRAME: usize = 96 * 1024 * 1024;
 
 /// One message: a name, some strings, some numbers, and at most one blob.
 ///

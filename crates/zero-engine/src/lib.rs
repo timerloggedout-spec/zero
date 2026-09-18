@@ -43,6 +43,11 @@ use text::{FontEntry, FontSet};
 /// The result of rendering: pixels plus clickable link regions (page coordinates).
 pub struct Page {
     pub canvas: Canvas,
+    /// The full height of the document, which is usually taller than `canvas`:
+    /// the canvas holds one band of it. What a scrollbar is sized from.
+    pub doc_height: f32,
+    /// The first document row `canvas` stands for.
+    pub band_top: f32,
     pub links: Vec<LinkArea>,
     /// console.log output and script errors, for the embedder to surface.
     pub console: Vec<String>,
@@ -709,12 +714,30 @@ impl Engine {
         self.render_document(&mut doc, width, height, loader)
     }
 
-    /// Render a [`Document`], which keeps its JavaScript runtime alive between frames.
+    /// Render a [`Document`], which keeps its JavaScript runtime alive between
+    /// frames. Paints the page whole; see [`Engine::render_band`] to paint only
+    /// the part that is on screen.
     pub fn render_document(
         &self,
         doc: &mut Document,
         width: f32,
         height: f32,
+        loader: &dyn ResourceLoader,
+    ) -> Page {
+        self.render_band(doc, width, height, None, loader)
+    }
+
+    /// Render one band of a [`Document`]: `height` rows starting at `band_top`.
+    ///
+    /// Layout is still done for the whole page — a page's height depends on all
+    /// of it — but only the requested rows are painted, so what this costs in
+    /// pixels does not grow with the length of the article.
+    pub fn render_band(
+        &self,
+        doc: &mut Document,
+        width: f32,
+        height: f32,
+        band: Option<(f32, f32)>,
         loader: &dyn ResourceLoader,
     ) -> Page {
         let root = &doc.root;
@@ -793,14 +816,23 @@ impl Engine {
         };
 
         let layout_root = layout::layout_tree(&style_root, viewport, fonts.as_ref(), &images);
-        // Canvas is at least the viewport, but grows to the full document height so
-        // the embedder can scroll through overflow.
         let doc_height = layout::content_bottom(&layout_root).max(height);
+        // Only the band the caller asked for is painted. `band` is `None` for a
+        // caller that wants the page whole — a screenshot, or an embedder that
+        // does its own scrolling through the canvas — and the cost of that is
+        // the whole document's pixels, which is why it is asked for explicitly.
+        let (band_top, band_height) = match band {
+            Some((top, height)) => {
+                let top = top.clamp(0.0, (doc_height - height).max(0.0));
+                (top, height.min(doc_height - top).max(1.0))
+            }
+            None => (0.0, doc_height),
+        };
         let bounds = layout::Rect {
             x: 0.0,
-            y: 0.0,
+            y: band_top,
             width,
-            height: doc_height,
+            height: band_height,
         };
         let (canvas, find_matches) = paint::paint(
             &layout_root,
@@ -816,6 +848,8 @@ impl Engine {
         layout::collect_element_rects(&layout_root, &mut element_rects);
         Page {
             canvas,
+            doc_height,
+            band_top,
             links,
             console,
             element_rects,
@@ -1285,6 +1319,51 @@ mod tests {
         let mut ids = Vec::new();
         ids_of(&doc.root, "input", &mut ids);
         ids[0]
+    }
+
+    #[test]
+    fn a_band_is_the_page_at_an_offset_not_a_different_page() {
+        // Three stacked 100px blocks, each its own colour. Painting the band
+        // that starts at 100 has to give exactly the middle one — the same
+        // pixels a caller would get by taking rows 100..200 of the whole page.
+        let html = "<body><div id=a></div><div id=b></div><div id=c></div></body>";
+        let css = "body { margin: 0; } div { height: 100px; }                    #a { background: #ff0000; } #b { background: #00ff00; }                    #c { background: #0000ff; }";
+        let engine = super::Engine::shapes_only();
+        let rgb = |c: crate::Color| (c.r, c.g, c.b);
+
+        let whole = engine.render(html, css, 50.0, 300.0);
+        assert_eq!(whole.height, 300);
+        assert_eq!(rgb(whole.pixels[150 * whole.width + 10]), (0, 255, 0));
+
+        let mut doc = super::Document::load(html, css);
+        let band =
+            engine.render_band(&mut doc, 50.0, 100.0, Some((100.0, 100.0)), &crate::resource::NullLoader);
+        assert_eq!((band.canvas.width, band.canvas.height), (50, 100));
+        // The whole page is still measured, so a scrollbar knows how long it is.
+        assert_eq!(band.doc_height, 300.0);
+        assert_eq!(band.band_top, 100.0);
+        // Every row of the band is the middle block, and neither neighbour.
+        for y in [1, 50, 98] {
+            let px = band.canvas.pixels[y * band.canvas.width + 10];
+            assert_eq!(rgb(px), (0, 255, 0), "row {y} of the band");
+        }
+    }
+
+    #[test]
+    fn a_band_asked_for_past_the_end_lands_inside_the_page() {
+        let engine = super::Engine::shapes_only();
+        let mut doc = super::Document::load(
+            "<body><div id=a></div></body>",
+            "body { margin: 0; } #a { height: 300px; background: #ff0000; }",
+        );
+        // Scrolled far past the bottom: clamped to the last screenful rather
+        // than painting nothing at all.
+        let band =
+            engine.render_band(&mut doc, 50.0, 100.0, Some((9000.0, 100.0)), &crate::resource::NullLoader);
+        assert_eq!(band.canvas.height, 100);
+        assert_eq!(band.band_top, 200.0);
+        let px = band.canvas.pixels[50 * band.canvas.width + 10];
+        assert_eq!((px.r, px.g, px.b), (255, 0, 0));
     }
 
     #[test]

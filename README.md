@@ -62,6 +62,7 @@ saved settings.
 | `hover:star` | a control lit, with its tooltip |
 | `search:wiki` | tab search, filtering |
 | `find:the` | the find bar, with its match count |
+| `scroll:2000` | the page scrolled down that many pixels |
 | `tabs:5` | extra tabs, one of them pinned |
 | `split` | two pages side by side |
 | `space:work` | a different profile, with its own accent |

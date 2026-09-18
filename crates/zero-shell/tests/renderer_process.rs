@@ -69,6 +69,49 @@ fn a_page_that_kills_the_renderer_does_not_take_the_browser_with_it() {
 }
 
 #[test]
+fn a_very_long_page_sends_a_frame_the_size_of_the_window() {
+    // A frame used to be the whole document, so a long article was tens of
+    // megabytes — past the pipe's ceiling, at which point the renderer looked
+    // dead and the browser panicked. What a frame costs must follow the window,
+    // not the length of the page.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zero"))
+        .arg("--render-worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the renderer worker");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = child.stdout.take().expect("child stdout");
+    let mut store = std::collections::HashMap::new();
+
+    // ~40,000 px of page: far past what a whole-document frame could carry.
+    let tall = format!(
+        "<html><body><style>div {{ height: 40px; background: #ff0000; }}</style>{}</body></html>",
+        "<div></div>".repeat(1000)
+    );
+    // Band at the top, 600 rows of a 400-wide window.
+    write_msg(&mut stdin, "render", &[&tall, "", ""], &[400.0, 600.0, 0.0]);
+    let first = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame for a long page");
+    assert_eq!(first.width, 400);
+    assert!(
+        first.height <= 700,
+        "a frame should be about a window tall, got {} rows",
+        first.height
+    );
+    assert!(first.pixels.len() < 8 * 1024 * 1024, "{} bytes is not one band", first.pixels.len());
+
+    // Scrolled deep into the page, the band follows rather than being clamped
+    // to the first screenful.
+    write_msg(&mut stdin, "resize", &[], &[400.0, 600.0, 30_000.0]);
+    let deep = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame further down");
+    assert_eq!(deep.width, 400);
+    assert!(deep.pixels.iter().any(|b| *b != 0), "the deep band should have been painted");
+
+    drop(stdin);
+    assert!(child.wait().expect("wait").success(), "the worker should exit cleanly");
+}
+
+#[test]
 fn an_icon_inside_a_link_or_a_span_is_still_drawn() {
     // `<a><svg/></a>` is how nearly every icon link on the web is written, and
     // `<span><svg/></span>` is how every icon beside a label is. Inline layout
@@ -368,7 +411,9 @@ fn decode_frame(msg: RawMsg) -> TestFrame {
     let (width, height) = (get(0) as usize, get(1) as usize);
     let is_focused = get(4) != 0.0;
     let rect_count = get(5) as usize;
-    let mut at = 8; // past the fixed [w,h,uses_hover,animating,is_focused,rects,links,matches]
+    // past the fixed header: [w, h, uses_hover, animating, is_focused,
+    // rects, links, matches, doc_height, band_top]
+    let mut at = 10;
     let mut element_rects = Vec::with_capacity(rect_count);
     for i in 0..rect_count {
         let (node_id, x, y, w, h) =

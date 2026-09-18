@@ -558,6 +558,12 @@ fn blend(dst: Color, src: Color, coverage: u8) -> Color {
 
 /// Paint a laid-out page. `find` highlights the runs matching a find-in-page
 /// query and reports where they are, so the embedder can scroll to them.
+/// Paint `layout_root` into a canvas the size of `bounds`.
+///
+/// `bounds.y` is the first document row the canvas stands for: 0 paints the page
+/// from the top, and any other value paints the band starting there. A browser
+/// only ever shows one screenful, and a long article is tens of megabytes of
+/// pixels it would otherwise have to paint, hold and hand over in full.
 pub fn paint(
     layout_root: &LayoutBox,
     bounds: Rect,
@@ -567,19 +573,36 @@ pub fn paint(
 ) -> (Canvas, Vec<Rect>) {
     let display_list = build_display_list(layout_root);
     let mut canvas = Canvas::new(bounds.width as usize, bounds.height as usize);
+    // Matches are reported in document coordinates — the embedder scrolls to
+    // them, and it may not be looking at this band — so they are taken before
+    // the list is moved onto the canvas.
     let matches = find
         .map(|q| highlight_rects(&display_list, q))
         .unwrap_or_default();
+
+    // `bounds.y` is the first document row this canvas stands for, so drawing it
+    // is the whole document shifted up by that much. A band is exactly that and
+    // nothing else, which is why painting one costs no special cases below.
+    let onto_canvas = Xf { scale: 1.0, dx: 0.0, dy: -bounds.y };
+    let display_list: DisplayList = match onto_canvas.is_none() {
+        true => display_list,
+        false => display_list.into_iter().map(|item| transform(item, onto_canvas)).collect(),
+    };
+    let matches_on_canvas: Vec<Rect> = match onto_canvas.is_none() {
+        true => matches.clone(),
+        false => matches.iter().map(|r| onto_canvas.rect(*r)).collect(),
+    };
+
     // The root background paints the whole canvas, not just the root's box, so a
     // short dark page doesn't leave white below it (CSS 2.1 §14.2).
     if let Some(color) = canvas_background(layout_root) {
-        canvas.paint_solid(color, bounds);
+        canvas.paint_solid(color, Rect { x: 0.0, y: 0.0, ..bounds });
     }
     // Two passes: everything under the text, then the find highlights, then the
     // text itself — a highlight must cover page backgrounds but sit under words.
     for pass in [Pass::Boxes, Pass::Text] {
         if pass == Pass::Text {
-            for rect in &matches {
+            for rect in &matches_on_canvas {
                 canvas.paint_solid(HIGHLIGHT, *rect);
             }
         }

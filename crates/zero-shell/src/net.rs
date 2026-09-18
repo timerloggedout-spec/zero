@@ -436,9 +436,8 @@ pub fn load_target(target: &str) -> Fetched {
     // Cookies are keyed by the site being visited, so set that before fetching.
     set_partition(target);
     if !is_url(target) {
-        let body = fs::read_to_string(target)
-            .unwrap_or_else(|e| error_page(target, &e.to_string()));
-        return Fetched { url: target.to_string(), body, secure: true }; // local: no network
+        // local: no network
+        return Fetched { url: target.to_string(), body: local_page(target), secure: true };
     }
 
     if let Some(rest) = target.strip_prefix("http://") {
@@ -453,6 +452,29 @@ pub fn load_target(target: &str) -> Fetched {
 
     let body = try_fetch(target).unwrap_or_else(|why| error_page(target, &why));
     Fetched { url: target.to_string(), body, secure: true }
+}
+
+/// The text of a local page file, or a page explaining why it could not be read.
+///
+/// A page saved in anything but UTF-8 — cp1252 out of a Windows editor, a legacy
+/// Shift-JIS document, a file with one stray byte in it — is still a page. Bytes
+/// that are not valid UTF-8 are replaced rather than refused, which is what a
+/// browser is expected to do with text it cannot name: show the page, mark the
+/// characters it could not read, and let the reader judge.
+///
+/// ponytail: no `<meta charset>` or BOM sniffing yet, so a cp1252 page shows
+/// replacement characters where its accents were rather than the right letters.
+/// Reading the declared encoding is the next increment; this one is about the
+/// file not being fatal.
+pub fn local_page(path: &str) -> String {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(why) => return error_page(path, &why.to_string()),
+    };
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(not_utf8) => String::from_utf8_lossy(not_utf8.as_bytes()).into_owned(),
+    }
 }
 
 /// The page shown when a load fails. It says what went wrong and what the user
