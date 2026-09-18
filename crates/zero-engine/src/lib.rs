@@ -461,11 +461,19 @@ impl Document {
                     }
                 }
                 NodeType::Element(ref e) => {
-                    // `nav` is navigation chrome, not readable content.
+                    // `nav` is navigation chrome, not readable content, and a
+                    // `<template>`'s children are markup a script has not used
+                    // yet — `{{ message }}`, not a sentence anyone wrote.
                     if matches!(
                         e.tag_name.as_str(),
-                        "script" | "style" | "head" | "noscript" | "nav"
+                        "script" | "style" | "head" | "noscript" | "nav" | "template"
                     ) {
+                        return;
+                    }
+                    // Not rendered, so not read out either. This is the tag-free
+                    // half of `[hidden]`; a thing hidden by a *stylesheet* still
+                    // reads, because this walks the DOM and never the cascade.
+                    if e.attributes.contains_key("hidden") {
                         return;
                     }
                     for child in &node.children {
@@ -586,6 +594,17 @@ const USER_AGENT_CSS: &str = "
     button { background: #e6e8ec; color: #111111; padding: 8px; border-radius: 4px;
         width: 160px; }
     head, script, style, meta, link, title, noscript, base { display: none; }
+    /* A <template>'s children are inert: parsed, but not rendered until a
+       script clones them. Without this, a site that ships its client-side
+       markup as a template — which is most of them — prints the `{{ }}`
+       placeholders in the middle of the page. */
+    template { display: none; }
+    /* The HTML `hidden` attribute, which the UA stylesheet is what makes mean
+       anything at all. A site's collapsed menus are marked with it, so
+       without this its navigation renders a second time, inline, under the
+       bar it belongs to. An author rule of the same specificity still wins,
+       which is how `[hidden] { display: block }` stays possible. */
+    [hidden] { display: none; }
     /* An <svg> is a picture, not a box of markup: it sits in a line like an
        image, and the shapes inside it are drawn by the rasterizer rather than
        laid out. Without this the source of every icon reads as text. */
@@ -1968,5 +1987,97 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
         );
         let centre = canvas.pixels[30 * canvas.width + 30];
         assert!(centre.r > 200 && centre.b < 60, "expected the gradient's centre stop, got {centre:?}");
+    }
+
+    /// Red at this point, or a description of what was there instead.
+    fn red_at(canvas: &crate::Canvas, x: usize, y: usize) -> bool {
+        let p = canvas.pixels[y * canvas.width + x];
+        p.r > 200 && p.g < 80 && p.b < 80
+    }
+
+    #[test]
+    fn an_absolute_box_anchors_to_the_nearest_positioned_ancestor_not_its_parent() {
+        // The overlay is a grandchild: its own parent is static and has been
+        // pushed 40px down the page by the filler above it. `top: 0` means the
+        // top of the *relative* grandparent, not of that parent — which is the
+        // difference between an overlay on the corner it was aimed at and one
+        // dropped into the middle of the text.
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=outer><div id=filler></div><div id=inner>\
+             <div id=overlay></div></div></div></body>",
+            "body { margin: 0; }
+             #outer { position: relative; height: 100px; }
+             #filler { height: 40px; }
+             #overlay { position: absolute; top: 0; left: 0;
+                        width: 10px; height: 10px; background: #ff0000; }",
+            100.0,
+            100.0,
+        );
+        assert!(red_at(&canvas, 5, 5), "the overlay belongs at the relative ancestor's top");
+        assert!(!red_at(&canvas, 5, 45), "it must not sit at its static parent's top");
+    }
+
+    #[test]
+    fn a_fixed_box_anchors_to_the_viewport_however_deep_it_sits() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=pad></div><div id=outer><div id=banner></div></div></body>",
+            "body { margin: 0; }
+             #pad { height: 60px; }
+             #outer { position: relative; height: 40px; }
+             #banner { position: fixed; top: 0; left: 0;
+                       width: 10px; height: 10px; background: #ff0000; }",
+            100.0,
+            100.0,
+        );
+        assert!(red_at(&canvas, 5, 5), "a fixed box starts at the viewport's own corner");
+        assert!(!red_at(&canvas, 5, 65), "not at the ancestor it happens to sit in");
+    }
+
+    #[test]
+    fn an_absolute_box_with_no_offsets_stays_where_it_would_have_been() {
+        // CSS calls this the static position. Falling back to the bottom of the
+        // containing block instead is how a card's own placeholder image came
+        // to be painted over the headline underneath it.
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=outer><div id=ghost></div><div id=rest></div></div></body>",
+            "body { margin: 0; }
+             #outer { position: relative; height: 100px; }
+             #ghost { position: absolute; width: 10px; height: 10px; background: #ff0000; }
+             #rest { height: 100px; }",
+            100.0,
+            100.0,
+        );
+        assert!(red_at(&canvas, 5, 5), "it stays at the top, where it was written");
+        assert!(!red_at(&canvas, 5, 95), "and does not fall to the bottom of its container");
+    }
+
+    #[test]
+    fn a_template_and_a_hidden_element_are_not_rendered_and_are_not_page_text() {
+        // Both are how a site ships markup it does not mean to show yet: the
+        // client-side template with its `{{ }}` placeholders, and the collapsed
+        // menu that would otherwise render the navigation a second time.
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><template><div id=t></div></template>\
+             <div id=h hidden></div><div id=shown></div></body>",
+            "body { margin: 0; }
+             #t, #h { height: 40px; background: #ff0000; }
+             #shown { height: 10px; background: #00ff00; }",
+            50.0,
+            50.0,
+        );
+        // Neither took a line: the green box is at the very top of the page.
+        let top = canvas.pixels[2 * canvas.width + 5];
+        assert_eq!((top.r, top.g, top.b), (0, 255, 0), "hidden markup still took space");
+
+        let doc = crate::Document::load(
+            "<body><template>{{ message }}</template>\
+             <p hidden>collapsed menu</p><p>real words</p></body>",
+            "",
+        );
+        assert_eq!(doc.page_text(), "real words");
     }
 }

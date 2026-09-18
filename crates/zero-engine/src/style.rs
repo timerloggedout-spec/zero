@@ -667,6 +667,11 @@ fn style_tree_inner<'a>(
         Some(Value::Length(v, Unit::Em)) => v * parent_font,
         Some(Value::Length(v, Unit::Rem)) => v * DEFAULT_FONT_SIZE,
         Some(Value::Length(v, Unit::Percent)) => v / 100.0 * parent_font,
+        // CSS lets a zero length go without a unit, so it arrives as a bare
+        // number rather than a length — and `font-size: 0` is how a control
+        // hides its own label while leaving it in the document for a screen
+        // reader. Falling through to the inherited size printed it instead.
+        Some(Value::Number(v)) => *v,
         _ => parent_font,
     };
     specified.insert("font-size".to_string(), Value::Length(font_px, Unit::Px));
@@ -770,6 +775,24 @@ mod tests {
         assert_eq!(by_id[0].line_height(), 40.0); // 2 * its own 20px font-size
         assert_eq!(by_id[1].line_height(), 30.0); // an absolute length, untouched
         assert_eq!(by_id[2].line_height(), 50.0); // absent: the 1.25 fallback
+    }
+
+    #[test]
+    fn a_unitless_zero_font_size_is_zero_and_does_not_inherit() {
+        // CSS lets a zero length go without a unit, so `font-size: 0` arrives
+        // as a bare number rather than a length. It is how a control hides its
+        // own label while leaving it in the document for a screen reader —
+        // rustdoc's "Copy item path" button, among many — and falling through
+        // to the inherited size printed the label across the page.
+        let html = "<body><p id=a>x</p><p id=b>x</p></body>";
+        let css = "body { font-size: 30px; } #a { font-size: 0; }";
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = style_tree(&dom, &sheet);
+        let by_id = elements(&styled);
+
+        assert_eq!(by_id[0].font_size(), 0.0);
+        assert_eq!(by_id[1].font_size(), 30.0); // its sibling still inherits
     }
 
     #[test]

@@ -153,6 +153,14 @@ pub struct LayoutBox<'a> {
     pub link_areas: Vec<LinkArea>,
     /// Backgrounds/borders for inline elements, painted beneath their text.
     pub inline_boxes: Vec<InlineBox>,
+    /// Where this box would have gone had it stayed in flow, recorded by its
+    /// parent while laying its in-flow children out.
+    ///
+    /// CSS calls this the static position, and it is what an out-of-flow box
+    /// that states neither `top` nor `left` keeps. `None` means nothing ever
+    /// placed it — a positioned child of a flex or grid container, which those
+    /// paths skip — and the containing block's own origin stands in.
+    static_position: Option<(f32, f32)>,
 }
 
 pub enum BoxType<'a> {
@@ -220,6 +228,7 @@ impl<'a> LayoutBox<'a> {
             text_fragments: Vec::new(),
             link_areas: Vec::new(),
             inline_boxes: Vec::new(),
+            static_position: None,
         }
     }
 
@@ -252,13 +261,38 @@ impl<'a> LayoutBox<'a> {
         }
     }
 
+    /// This box's `position`, as far as layout cares: out of flow and anchored
+    /// to what.
+    fn out_of_flow(&self) -> Option<OutOfFlow> {
+        match self.box_type {
+            BoxType::AnonymousBlock => None,
+            _ => match self.get_style_node().value("position") {
+                Some(Value::Keyword(ref k)) if k == "absolute" => Some(OutOfFlow::Absolute),
+                Some(Value::Keyword(ref k)) if k == "fixed" => Some(OutOfFlow::Fixed),
+                _ => None,
+            },
+        }
+    }
+
     /// True when this box is taken out of normal flow (`absolute` or `fixed`).
     fn is_out_of_flow(&self) -> bool {
+        self.out_of_flow().is_some()
+    }
+
+    /// Whether an `absolute` descendant resolves its offsets against this box.
+    ///
+    /// CSS says the containing block is the nearest ancestor whose `position`
+    /// is anything but `static` — not the parent. An overlay is almost always
+    /// written as a deeply nested child of one `position: relative` wrapper,
+    /// so anchoring it to its parent instead lands it in the middle of the
+    /// content rather than over the corner it was aimed at.
+    fn is_containing_block(&self) -> bool {
         match self.box_type {
             BoxType::AnonymousBlock => false,
             _ => matches!(
                 self.get_style_node().value("position"),
-                Some(Value::Keyword(ref k)) if k == "absolute" || k == "fixed"
+                Some(Value::Keyword(ref k))
+                    if k == "relative" || k == "absolute" || k == "fixed" || k == "sticky"
             ),
         }
     }
@@ -317,37 +351,39 @@ impl<'a> LayoutBox<'a> {
         }
         self.calculate_block_height(containing_block);
         // A replaced element (<img>) overrides content size with its resolved dimensions.
-        if let Some((w, h)) = self.resolved_image_size(images) {
+        if let Some((w, h)) = self.resolved_image_size(images, (containing_block.content.width, containing_block.content.height)) {
             self.dimensions.content.width = w;
             self.dimensions.content.height = h;
         }
-        // Positioned children resolve against this box's *final* size, so they run
-        // last — `bottom`/`right` are meaningless until the height/width are known.
-        self.layout_positioned_children(fonts, images);
+        // Positioned descendants resolve against this box's *final* size, so they
+        // run last — `bottom`/`right` are meaningless until the height/width are
+        // known. Only a box that is actually a containing block does this; a
+        // static box's positioned descendants belong to an ancestor, and
+        // `fixed` ones belong to the viewport, which `layout_tree` handles.
+        if self.is_containing_block() {
+            self.place_descendants(OutOfFlow::Absolute, fonts, images);
+        }
     }
 
-    fn layout_positioned_children(&mut self, fonts: Option<&FontSet>, images: &ImageMap) {
+    /// Lay out every out-of-flow descendant of the given kind that this box is
+    /// the containing block for, and place it.
+    fn place_descendants(
+        &mut self,
+        want: OutOfFlow,
+        fonts: Option<&FontSet>,
+        images: &ImageMap,
+    ) {
         let container = self.dimensions;
-        for child in &mut self.children {
-            if !child.is_out_of_flow() {
-                continue;
-            }
-            // Pass 1 measures the box so `right`/`bottom` can be resolved.
-            child.layout(container, fonts, images);
-            let (x, y) = child.positioned_origin(container);
-            // Pass 2 lays the whole subtree out at its final origin, so descendants
-            // and text land in the right place instead of being moved afterwards.
-            let mut slot = container;
-            slot.content.x = x;
-            slot.content.y = y;
-            slot.content.height = 0.0;
-            child.layout(slot, fonts, images);
-        }
+        place_out_of_flow(&mut self.children, container, want, fonts, images);
     }
 
     /// If this box is an `<img>`, resolve its display size from CSS width/height,
     /// else the `width`/`height` attributes, else the image's intrinsic size.
-    fn resolved_image_size(&self, images: &ImageMap) -> Option<(f32, f32)> {
+    fn resolved_image_size(
+        &self,
+        images: &ImageMap,
+        available: (f32, f32),
+    ) -> Option<(f32, f32)> {
         let styled = match self.box_type {
             BoxType::BlockNode(n) | BoxType::InlineNode(n) => n,
             BoxType::AnonymousBlock => return None,
@@ -364,21 +400,34 @@ impl<'a> LayoutBox<'a> {
             _ => return None,
         };
         let img = images.get(&src);
-        let css_px = |name: &str| styled.px(name, 0.0).filter(|v| *v > 0.0);
+        // Percentages resolve against the containing block, not against zero —
+        // `width: 100%` is how nearly every photo on a news or product page is
+        // sized, and resolving it to nothing fell through to the file's own
+        // pixel size. A 1536px press photo then covered whatever column it was
+        // supposed to sit inside.
+        let css_px = |name: &str, base: f32| styled.px(name, base).filter(|v| *v > 0.0);
         let attr_px = |name: &str| {
             elem.attributes
                 .get(name)
                 .and_then(|s| s.trim().parse::<f32>().ok())
         };
 
-        let w = css_px("width")
-            .or_else(|| attr_px("width"))
-            .or_else(|| img.map(|i| i.width as f32))?;
-        let h = css_px("height")
-            .or_else(|| attr_px("height"))
-            .or_else(|| img.map(|i| i.height as f32))
-            .unwrap_or(w);
-        Some((w, h))
+        let given_w = css_px("width", available.0).or_else(|| attr_px("width"));
+        let given_h = css_px("height", available.1).or_else(|| attr_px("height"));
+        let natural = img.map(|i| (i.width as f32, i.height as f32));
+        // With one axis given and a picture to measure, the other follows the
+        // aspect ratio. Keeping the file's own height beside a scaled width is
+        // what stretched a wide photo down over the text beneath it.
+        Some(match (given_w, given_h, natural) {
+            (Some(w), Some(h), _) => (w, h),
+            (Some(w), None, Some((nw, nh))) if nw > 0.0 => (w, w * nh / nw),
+            (None, Some(h), Some((nw, nh))) if nh > 0.0 => (h * nw / nh, h),
+            // No picture, or one with no measurable size: no ratio to keep.
+            (Some(w), None, _) => (w, w),
+            (None, Some(h), _) => (h, h),
+            (None, None, Some(size)) => size,
+            (None, None, None) => return None,
+        })
     }
 
     /// Table layout: align cells into shared columns, honouring colspan/rowspan.
@@ -1387,7 +1436,11 @@ impl<'a> LayoutBox<'a> {
         let mut floats: Vec<FloatRect> = Vec::new();
         for (i, child) in self.children.iter_mut().enumerate() {
             if child.is_out_of_flow() {
-                continue; // positioned later, once the container's size is final
+                // Positioned later, once the container's size is final — but
+                // where it *would* have gone is only knowable here, and a box
+                // stating neither `top` nor `left` is supposed to stay there.
+                child.static_position = Some((d.content.x, d.content.y + d.content.height));
+                continue;
             }
             // `clear` drops this child below the floats it names.
             if let Some(cleared) = child.clear_sides() {
@@ -1744,10 +1797,79 @@ pub fn layout_tree<'a>(
     images: &ImageMap,
 ) -> LayoutBox<'a> {
     // Height starts at 0 so children accumulate into it.
+    let viewport = containing_block;
     containing_block.content.height = 0.0;
     let mut root_box = build_layout_tree(node);
     root_box.layout(containing_block, fonts, images);
+    // The root is the last containing block standing: an `absolute` box with no
+    // positioned ancestor anywhere above it anchors to the page, and every
+    // `fixed` box anchors to the viewport no matter what it sits inside.
+    root_box.place_descendants(OutOfFlow::Absolute, fonts, images);
+    place_out_of_flow(&mut root_box.children, viewport, OutOfFlow::Fixed, fonts, images);
     root_box
+}
+
+/// Which out-of-flow boxes a placing walk is looking for.
+#[derive(Clone, Copy, PartialEq)]
+enum OutOfFlow {
+    /// Anchored to the nearest positioned ancestor.
+    Absolute,
+    /// Anchored to the viewport.
+    ///
+    /// ponytail: anchored, but not *stuck* — the engine paints a document and
+    /// the embedder scrolls through it, so a fixed header sits at the top of
+    /// the page rather than riding the window down. Making it ride needs the
+    /// scroll offset to reach layout, which is a compositing change.
+    Fixed,
+}
+
+/// Place every out-of-flow box of kind `want` in this subtree against
+/// `container`, descending through anything that is not itself responsible for
+/// them.
+///
+/// A box already placed here is not descended into: it is the containing block
+/// for its own positioned descendants, and laying it out placed them.
+fn place_out_of_flow(
+    children: &mut [LayoutBox],
+    container: Dimensions,
+    want: OutOfFlow,
+    fonts: Option<&FontSet>,
+    images: &ImageMap,
+) {
+    for child in children {
+        if child.out_of_flow() == Some(want) {
+            // Pass 1 measures the box, so `right`/`bottom` can be resolved —
+            // and it runs at the static position, so a box stating neither
+            // `top` nor `left` is measured where it already belongs. Measuring
+            // against the containing block instead left it at the *bottom* of
+            // that block, which is how a card's own placeholder image came to
+            // be painted over the headline beneath it.
+            let (sx, sy) = child
+                .static_position
+                .unwrap_or((container.content.x, container.content.y));
+            let mut probe = container;
+            probe.content.x = sx;
+            probe.content.y = sy;
+            probe.content.height = 0.0;
+            child.layout(probe, fonts, images);
+            let (x, y) = child.positioned_origin(container);
+            // Pass 2 lays the whole subtree out at its final origin, so descendants
+            // and text land in the right place instead of being moved afterwards.
+            let mut slot = container;
+            slot.content.x = x;
+            slot.content.y = y;
+            slot.content.height = 0.0;
+            child.layout(slot, fonts, images);
+            continue;
+        }
+        // An `absolute` walk stops at the next containing block down — that box
+        // owns what is inside it. A `fixed` walk stops at nothing, because
+        // nothing but the viewport ever owns a fixed box.
+        if want == OutOfFlow::Absolute && child.is_containing_block() {
+            continue;
+        }
+        place_out_of_flow(&mut child.children, container, want, fonts, images);
+    }
 }
 
 struct TextPiece {
@@ -3079,6 +3201,43 @@ mod tests {
         let placed = laid.children[0].dimensions.margin_box();
         assert_eq!(placed.x, 900.0 - 20.0 - 100.0); // right edge is 20 from the container's
         assert_eq!(placed.y, 200.0 - 10.0 - 40.0); // bottom edge is 10 from the container's
+    }
+
+    #[test]
+    fn a_percentage_width_on_a_picture_measures_its_box_and_takes_the_height_with_it() {
+        // `width: 100%` used to resolve against a base of zero, so it was
+        // discarded and the file's own pixel size took over — a 1536px press
+        // photo then covered whatever column it was supposed to sit in. And a
+        // scaled width with the original height is a picture stretched down
+        // over the text beneath it, so the ratio has to come along.
+        let node = dom::elem("img".into(), HashMap::from([("src".into(), "pic".into())]), vec![]);
+        let mut values = HashMap::new();
+        values.insert("display".to_string(), Value::Keyword("block".into()));
+        values.insert("width".to_string(), Value::Length(50.0, Unit::Percent));
+        let img = StyledNode { node: &node, specified_values: values, children: vec![] };
+
+        let root_node = dom::elem("div".into(), HashMap::new(), vec![]);
+        let mut root_values = HashMap::new();
+        root_values.insert("display".to_string(), Value::Keyword("block".into()));
+        let root = StyledNode {
+            node: &root_node,
+            specified_values: root_values,
+            children: vec![img],
+        };
+
+        // A 40x20 picture, half of a 200px-wide page: 100 across, and the
+        // height halves with it rather than staying at the file's 20.
+        let mut images = ImageMap::new();
+        images.insert(
+            "pic".to_string(),
+            crate::resource::DecodedImage { width: 40, height: 20, pixels: vec![] },
+        );
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 200.0;
+        let laid = layout_tree(&root, viewport, None, &images);
+
+        let picture = laid.children[0].dimensions.content;
+        assert_eq!((picture.width, picture.height), (100.0, 50.0));
     }
 
     #[test]
