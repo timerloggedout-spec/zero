@@ -1,8 +1,8 @@
 //! Style: match CSS rules to DOM nodes and produce a styled tree (the cascade).
 
 use crate::css::{
-    Combinator, LengthContext, Pseudo, Rule, Selector, SelectorPart, SimpleSelector, Specificity,
-    Stylesheet, Unit, Value, DEFAULT_FONT_SIZE,
+    Color, Combinator, LengthContext, Pseudo, PseudoElement, Rule, Selector, SelectorPart,
+    SimpleSelector, Specificity, Stylesheet, Unit, Value, DEFAULT_FONT_SIZE,
 };
 use crate::dom::{ElementData, Node, NodeType};
 use std::collections::HashMap;
@@ -25,6 +25,9 @@ pub enum Display {
     Table,
     /// Sits in a line like text, but sizes itself like a block.
     InlineBlock,
+    /// No box at all: the element's children take its place in its parent's
+    /// layout. A wrapper around grid items is what it is for.
+    Contents,
     None,
 }
 
@@ -80,6 +83,44 @@ impl<'a> StyledNode<'a> {
             .unwrap_or_else(|| default.clone())
     }
 
+    /// One side's (`top`, `right` …) border width. Zero unless the side has a
+    /// style that draws: `none` and `hidden` take the width with them, and so
+    /// does no style at all, since the initial style is `none`.
+    pub fn border_width(&self, side: &str) -> Value {
+        match self.value(&format!("border-{side}-style")) {
+            Some(Value::Keyword(k)) if k != "none" && k != "hidden" => self
+                .value(&format!("border-{side}-width"))
+                .unwrap_or(Value::Length(3.0, Unit::Px)), // `medium`
+            _ => Value::Length(0.0, Unit::Px),
+        }
+    }
+
+    /// The colour one side's border paints in, or `None` if it paints nothing.
+    /// No colour, or `currentcolor`, is the text colour.
+    pub fn border_color(&self, side: &str) -> Option<Color> {
+        if self.border_width(side).resolve(self.length_context(0.0)) <= 0.0 {
+            return None;
+        }
+        match self.value(&format!("border-{side}-color")) {
+            Some(Value::ColorValue(c)) => Some(c),
+            None => self.text_color(),
+            Some(Value::Keyword(k)) if k.eq_ignore_ascii_case("currentcolor") => self.text_color(),
+            _ => None,
+        }
+    }
+
+    fn text_color(&self) -> Option<Color> {
+        match self.value("color") {
+            Some(Value::ColorValue(c)) => Some(c),
+            _ => Some(Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            }),
+        }
+    }
+
     pub fn display(&self) -> Display {
         let display = self.declared_display();
         // A float is block-level whatever it says it is (CSS 9.7), and the box
@@ -105,6 +146,7 @@ impl<'a> StyledNode<'a> {
                 "grid" | "inline-grid" => Display::Grid,
                 "table" | "inline-table" => Display::Table,
                 "none" => Display::None,
+                "contents" => Display::Contents,
                 _ => Display::Inline,
             },
             _ => Display::Inline,
@@ -221,8 +263,10 @@ fn matches_chain<E: Matchable>(
     parts: &[SelectorPart],
     hovered: &HoverChain,
 ) -> bool {
-    let Some((subject, rest)) = parts.split_last() else { return true };
-    if !matches_simple_selector(cursor.elem(), &subject.simple, hovered) {
+    let Some((subject, rest)) = parts.split_last() else {
+        return true;
+    };
+    if !matches_simple_selector(cursor, ancestors, &subject.simple, hovered) {
         return false;
     }
     if rest.is_empty() {
@@ -249,41 +293,62 @@ fn matches_chain<E: Matchable>(
 }
 
 fn matches_simple_selector<E: Matchable>(
-    elem: &E,
+    cursor: &Cursor<E>,
+    ancestors: &[Cursor<E>],
     selector: &SimpleSelector,
     hovered: &HoverChain,
 ) -> bool {
+    let elem = cursor.elem();
     if selector.tag_name.iter().any(|name| elem.tag() != name) {
         return false;
     }
-    if selector.id.iter().any(|id| elem.elem_id() != Some(id.as_str())) {
+    if selector
+        .id
+        .iter()
+        .any(|id| elem.elem_id() != Some(id.as_str()))
+    {
         return false;
     }
     if selector.class.iter().any(|class| !elem.has_class(class)) {
         return false;
     }
-    if !selector.attrs.iter().all(|test| test.matches(elem.attr(&test.name))) {
+    if !selector
+        .attrs
+        .iter()
+        .all(|test| test.matches(elem.attr(&test.name)))
+    {
         return false;
     }
     selector
         .pseudos
         .iter()
-        .all(|pseudo| matches_pseudo(elem, pseudo, hovered))
+        .all(|pseudo| matches_pseudo(cursor, ancestors, pseudo, hovered))
 }
 
-fn matches_pseudo<E: Matchable>(elem: &E, pseudo: &Pseudo, hovered: &HoverChain) -> bool {
+fn matches_pseudo<E: Matchable>(
+    cursor: &Cursor<E>,
+    ancestors: &[Cursor<E>],
+    pseudo: &Pseudo,
+    hovered: &HoverChain,
+) -> bool {
+    let elem = cursor.elem();
     let pos = elem.pos();
+    // An argument may be a whole chain (`:not(nav a)`), checked from here up.
+    let any = |list: &[Selector]| list.iter().any(|s| matches(cursor, ancestors, s, hovered));
     match pseudo {
         Pseudo::Hover => hovered.contains(&elem.node_id()),
         Pseudo::NthChild(a, b) => nth_matches(*a, *b, pos.index),
         Pseudo::NthLastChild(a, b) => nth_matches(*a, *b, pos.count + 1 - pos.index.min(pos.count)),
         Pseudo::NthOfType(a, b) => nth_matches(*a, *b, pos.type_index),
-        Pseudo::NthLastOfType(a, b) => {
-            nth_matches(*a, *b, pos.type_count + 1 - pos.type_index.min(pos.type_count))
-        }
+        Pseudo::NthLastOfType(a, b) => nth_matches(
+            *a,
+            *b,
+            pos.type_count + 1 - pos.type_index.min(pos.type_count),
+        ),
         Pseudo::OnlyChild => pos.count == 1,
         Pseudo::OnlyOfType => pos.type_count == 1,
-        Pseudo::Not(inner) => !matches_simple_selector(elem, inner, hovered),
+        Pseudo::Is(list) | Pseudo::Where(list) => any(list),
+        Pseudo::Not(list) => !any(list),
         Pseudo::AttrPresent(name) => elem.attr(name).is_some(),
         Pseudo::AttrAbsent(name) => elem.attr(name).is_none(),
         Pseudo::Never => false,
@@ -365,7 +430,7 @@ impl RuleIndex {
 
 /// (specificity, document order, rule) — order breaks specificity ties, so a
 /// bucketed sweep cascades exactly like a linear one.
-type MatchedRule<'a> = (Specificity, usize, &'a Rule);
+type MatchedRule<'a> = (Specificity, usize, &'a Rule, Option<PseudoElement>);
 
 fn match_rule<'a>(
     cursor: &Cursor<ElementData>,
@@ -377,7 +442,13 @@ fn match_rule<'a>(
     rule.selectors
         .iter()
         .find(|selector| matches(cursor, ancestors, selector, hovered))
-        .map(|selector| (selector.specificity(), order, rule))
+        .map(|selector| {
+            // Which selector matched decides whether these declarations style
+            // the element or a box generated beside it — `p::before, div { }`
+            // is one rule doing both.
+            let generated = selector.parts.last().and_then(|p| p.simple.pseudo_element);
+            (selector.specificity(), order, rule, generated)
+        })
 }
 
 fn matching_rules<'a>(
@@ -407,10 +478,34 @@ fn specified_values(
     let mut rules = matching_rules(cursor, ancestors, stylesheet, index, hovered);
     // Apply low specificity first so high specificity overrides it, and let
     // document order settle ties.
-    rules.sort_by(|&(a, ai, _), &(b, bi, _)| a.cmp(&b).then(ai.cmp(&bi)));
-    for (_, _, rule) in rules {
+    rules.sort_by(|&(a, ai, ..), &(b, bi, ..)| a.cmp(&b).then(ai.cmp(&bi)));
+    for (_, _, rule, generated) in rules {
+        // A `::before` rule styles a box that does not exist yet, so its
+        // declarations are kept aside under a name no property can collide
+        // with rather than applied to the element they were hung off.
+        let prefix = match generated {
+            Some(PseudoElement::Before) => "::before:",
+            Some(PseudoElement::After) => "::after:",
+            None => "",
+        };
         for declaration in &rule.declarations {
-            values.insert(declaration.name.clone(), declaration.value.clone());
+            values.insert(
+                format!("{prefix}{}", declaration.name),
+                declaration.value.clone(),
+            );
+        }
+    }
+    // An inline `style` attribute is the last word in the cascade, whatever any
+    // rule's specificity. It is where a page puts what it worked out for itself
+    // — a bar's width, a card's background image, a tooltip's offsets — so a
+    // page that computes its layout has none of it without this.
+    //
+    // ponytail: `!important` is not modelled anywhere in this engine, so there
+    // is nothing here for an important declaration to lose to. When it is,
+    // this is the arm that has to stop being unconditional.
+    if let Some(inline) = cursor.elem().attributes.get("style") {
+        for declaration in crate::css::parse_style_attribute(inline) {
+            values.insert(declaration.name, declaration.value);
         }
     }
     values
@@ -468,7 +563,11 @@ fn parse_attr_color(value: &str) -> Option<Value> {
 /// `width="120"` means pixels; `width="85%"` is a percentage.
 fn parse_attr_length(value: &str) -> Option<Value> {
     match value.strip_suffix('%') {
-        Some(number) => number.trim().parse().ok().map(|n| Value::Length(n, Unit::Percent)),
+        Some(number) => number
+            .trim()
+            .parse()
+            .ok()
+            .map(|n| Value::Length(n, Unit::Percent)),
         None => value.parse().ok().map(|n| Value::Length(n, Unit::Px)),
     }
 }
@@ -482,23 +581,57 @@ fn is_custom_property(name: &str) -> bool {
 /// Replace every `var(--name)` in `text` with the variable's value, or the
 /// fallback after the comma when it has none.
 ///
-/// ponytail: no cycle detection and one level of substitution, so a variable
-/// defined in terms of another resolves only if the sheet already did the work.
-fn substitute_vars(text: &str, vars: &PropertyMap) -> Option<String> {
+/// Substitution is recursive: a custom property defined in terms of another
+/// resolves all the way down, which is how every token-based design system on
+/// the web is built. `stack` carries the names currently being resolved, so a
+/// reference cycle is caught rather than recursed into — in a renderer
+/// process a stack overflow aborts instead of unwinding, so a cyclic sheet
+/// would otherwise be an availability bug.
+fn substitute_vars(text: &str, vars: &PropertyMap, stack: &mut Vec<String>) -> Option<String> {
+    // Per spec a substitution that nests this deep is invalid at computed-value
+    // time. The stack catches cycles; this catches a chain long enough to be a
+    // mistake either way.
+    const MAX_DEPTH: usize = 32;
+    if stack.len() > MAX_DEPTH {
+        return None;
+    }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("var(") {
         out.push_str(&rest[..start]);
         let body_start = start + "var(".len();
-        let end = rest[body_start..].find(')')? + body_start;
-        let (name, fallback) = match rest[body_start..end].split_once(',') {
+        // The body runs to the *matching* paren, not the first one: a fallback
+        // is an arbitrary token stream and may nest — `var(--x, rgb(0,0,0))`.
+        let end = body_start + crate::css::matching_paren(&rest[body_start..])?;
+        let body = &rest[body_start..end];
+        // The fallback is everything after the first top-level comma, commas
+        // inside it included: `var(--pair, 1px 2px)`, `var(--c, rgb(1,2,3))`.
+        let (name, fallback) = match crate::css::split_top_level_comma(body) {
             Some((name, fallback)) => (name.trim(), Some(fallback.trim())),
-            None => (rest[body_start..end].trim(), None),
+            None => (body.trim(), None),
         };
-        let value = match vars.get(name) {
-            Some(Value::Raw(raw)) => Some(raw.clone()),
-            Some(other) => Some(format!("{other:?}")), // never happens: customs stay raw
-            None => fallback.map(str::to_string),
+        let substituted = match vars.get(name) {
+            _ if stack.iter().any(|seen| seen == name) => None,
+            Some(Value::Raw(raw)) => {
+                let raw = raw.clone();
+                stack.push(name.to_string());
+                let resolved = substitute_vars(&raw, vars, stack);
+                stack.pop();
+                resolved
+            }
+            // Custom properties are always kept as raw text by the parser, so
+            // any other shape means this name is not a custom property at all.
+            Some(_) => None,
+            None => None,
+        };
+        let value = match substituted {
+            Some(value) => Some(value),
+            // A missing or cyclic reference falls back, and the fallback may
+            // itself mention variables.
+            None => match fallback {
+                Some(fallback) => substitute_vars(fallback, vars, stack),
+                None => None,
+            },
         };
         // An unresolvable var makes the whole declaration invalid, per CSS.
         out.push_str(&value?);
@@ -526,16 +659,113 @@ fn resolve_vars(values: &mut PropertyMap, vars: &PropertyMap) {
         return;
     }
     for (name, text) in pending {
-        match substitute_vars(&text, vars).and_then(|text| crate::css::parse_value(&text)) {
-            Some(value) => {
-                values.insert(name, value);
-            }
-            // Leave nothing behind rather than a value we could not read.
-            None => {
-                values.remove(&name);
-            }
+        // Leave nothing behind rather than a value we could not read.
+        values.remove(&name);
+        let Some(text) = substitute_vars(&text, vars, &mut Vec::new()) else {
+            continue;
+        };
+        // ponytail: the cascade has already been flattened into a map by this
+        // point, so a shorthand that arrives through a variable overwrites a
+        // longhand set next to it whichever was written last. Only var-valued
+        // shorthands can reach this; the rest expand before the cascade runs.
+        for declaration in crate::css::declarations_for(&name, &text) {
+            values.insert(declaration.name, declaration.value);
         }
     }
+}
+
+/// Replace `counter()` and `counters()` inside every `content` value with the
+/// numbers they stand for.
+///
+/// Done here rather than at layout time because a counter's value depends on
+/// where the element sits in document order, and this walk is the only pass that
+/// knows that. What layout receives is an ordinary string component.
+fn resolve_counter_functions(values: &mut PropertyMap, counters: &crate::counters::Counters) {
+    const PROPERTIES: [&str; 3] = ["content", "::before:content", "::after:content"];
+    for property in PROPERTIES {
+        let Some(Value::Raw(raw)) = values.get(property) else {
+            continue;
+        };
+        if !raw.contains("counter") {
+            continue;
+        }
+        let resolved = substitute_counters(raw, counters);
+        values.insert(property.to_string(), Value::Raw(resolved));
+    }
+}
+
+/// `counter(name, style)` and `counters(name, sep, style)`, turned into quoted
+/// strings so the rest of the `content` grammar is unchanged by their presence.
+fn substitute_counters(raw: &str, counters: &crate::counters::Counters) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(at) = find_counter_call(rest) {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let nested = tail.starts_with("counters(");
+        let open = tail.find('(').expect("a call has parens");
+        let Some(close) = crate::css::matching_paren(&tail[open + 1..]) else {
+            break;
+        };
+        let args: Vec<&str> = tail[open + 1..open + 1 + close]
+            .split(',')
+            .map(str::trim)
+            .collect();
+        let name = args.first().copied().unwrap_or("");
+        let text = match nested {
+            // `counters(name, separator, style?)` — the separator is a string.
+            true => {
+                let separator = args.get(1).map(|s| strip_quotes(s)).unwrap_or_default();
+                let style = args.get(2).copied().unwrap_or("decimal");
+                counters.nested(name, &separator, style)
+            }
+            false => counters.value(name, args.get(1).copied().unwrap_or("decimal")),
+        };
+        // Quoted, so a counter that formats to nothing does not swallow the
+        // component that follows it.
+        out.push('"');
+        out.push_str(&text.replace('"', "\\22 "));
+        out.push('"');
+        rest = &tail[open + 1 + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The next `counter(`/`counters(` that is not inside a quoted string — a
+/// `content: "counter("` is text, not a call.
+fn find_counter_call(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(_) if c == b'\\' => i += 1,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'"' || c == b'\'' => quote = Some(c),
+            None if text[i..].starts_with("counter(") || text[i..].starts_with("counters(") => {
+                return Some(i)
+            }
+            None => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn strip_quotes(text: &str) -> String {
+    let trimmed = text.trim();
+    ['"', '\'']
+        .iter()
+        .find_map(|q| {
+            trimmed
+                .strip_prefix(*q)
+                .and_then(|r| r.strip_suffix(*q))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| trimmed.to_string())
 }
 
 /// Properties that flow from parent to child when the child doesn't set them.
@@ -546,9 +776,10 @@ fn resolve_vars(values: &mut PropertyMap, vars: &PropertyMap) {
 /// never declared it — but a text node here reads its own value with no such
 /// propagation mechanism, so treating it as inherited is what makes
 /// `p { text-decoration: underline }` reach the text at all.
-const INHERITED_PROPERTIES: [&str; 10] = [
+const INHERITED_PROPERTIES: [&str; 13] = [
     "color",
     "font-size",
+    "font-family",
     "text-align",
     "white-space",
     "visibility",
@@ -557,6 +788,8 @@ const INHERITED_PROPERTIES: [&str; 10] = [
     "letter-spacing",
     "font-weight",
     "font-style",
+    "text-transform",
+    "text-shadow",
 ];
 
 pub fn style_tree<'a>(root: &'a Node, stylesheet: &'a Stylesheet) -> StyledNode<'a> {
@@ -593,6 +826,26 @@ pub fn style_tree_animated<'a>(
     hovered: &HoverChain,
     anim: &mut crate::anim::Animator,
 ) -> StyledNode<'a> {
+    style_tree_counted(
+        root,
+        stylesheet,
+        index,
+        hovered,
+        anim,
+        &mut Default::default(),
+    )
+}
+
+/// The same, with the counter scopes the walk maintains. Counters are a
+/// document-order thing, so this walk is the only place they can be resolved.
+pub fn style_tree_counted<'a>(
+    root: &'a Node,
+    stylesheet: &'a Stylesheet,
+    index: &RuleIndex,
+    hovered: &HoverChain,
+    anim: &mut crate::anim::Animator,
+    counters: &mut crate::counters::Counters,
+) -> StyledNode<'a> {
     let cursor = match root.node_type {
         NodeType::Element(ref elem) => Some(Cursor::only(elem)),
         NodeType::Text(_) => None,
@@ -607,9 +860,13 @@ pub fn style_tree_animated<'a>(
         &mut Vec::new(),
         hovered,
         anim,
+        counters,
     )
 }
 
+// Every argument is threaded down the whole recursion; bundling them into a
+// context struct buys nothing but a second name for the same nine fields.
+#[allow(clippy::too_many_arguments)]
 fn style_tree_inner<'a>(
     root: &'a Node,
     cursor: Option<Cursor<'a, ElementData>>,
@@ -620,6 +877,7 @@ fn style_tree_inner<'a>(
     ancestors: &mut Vec<Cursor<'a, ElementData>>,
     hovered: &HoverChain,
     anim: &mut crate::anim::Animator,
+    counters: &mut crate::counters::Counters,
 ) -> StyledNode<'a> {
     let mut specified = match cursor {
         Some(ref cursor) => specified_values(cursor, ancestors, stylesheet, index, hovered),
@@ -629,7 +887,7 @@ fn style_tree_inner<'a>(
     // back at where it has actually got to, so layout and paint see one
     // consistent frame rather than the destination.
     if let Some(ref cursor) = cursor {
-        anim.apply(cursor.elem().node_id, &mut specified);
+        anim.apply(cursor.elem().node_id, &mut specified, &stylesheet.keyframes);
     }
     for prop in INHERITED_PROPERTIES {
         if !specified.contains_key(prop) {
@@ -675,6 +933,15 @@ fn style_tree_inner<'a>(
         _ => parent_font,
     };
     specified.insert("font-size".to_string(), Value::Length(font_px, Unit::Px));
+    // Counters, then the `content` values that read them: an element's own
+    // `counter-increment` is visible to its own `::before`, which is exactly how
+    // a numbered heading is written.
+    counters.apply(&specified, ancestors.len());
+    resolve_counter_functions(&mut specified, counters);
+    // A counter a child resets stays in scope for its *following siblings*, so
+    // the scope is unwound once this element runs out of children, not once each
+    // child's subtree does.
+    let counter_mark = counters.mark();
     // Children see this element as their nearest ancestor.
     if let Some(ref cursor) = cursor {
         ancestors.push(cursor.clone());
@@ -707,9 +974,11 @@ fn style_tree_inner<'a>(
             };
             style_tree_inner(
                 child, cursor, stylesheet, index, &specified, &vars, ancestors, hovered, anim,
+                counters,
             )
         })
         .collect();
+    counters.rewind(counter_mark);
     if cursor.is_some() {
         ancestors.pop();
     }
@@ -747,7 +1016,12 @@ mod tests {
         node.value("color")
     }
 
-    const RED: Value = Value::ColorValue(crate::css::Color { r: 255, g: 0, b: 0, a: 255 });
+    const RED: Value = Value::ColorValue(crate::css::Color {
+        r: 255,
+        g: 0,
+        b: 0,
+        a: 255,
+    });
 
     /// Elements come out of the parser unnumbered; the Document assigns ids
     /// normally, so a bare tree has to be numbered before ids mean anything.
@@ -796,14 +1070,48 @@ mod tests {
     }
 
     #[test]
+    fn an_inline_style_attribute_is_the_last_word_in_the_cascade() {
+        let html = "<body>\
+            <p id=a class=wide>plain</p>\
+            <p id=b class=wide style='width: 120px'>inline wins</p>\
+            <p id=c class=wide style='--w: 200px; width: var(--w)'>inline var</p>\
+            <p id=d class=wide style='malformed; width: 300px'>broken, then good</p>\
+            </body>";
+        // `#id` beats `.class`, so the stylesheet here is as specific as it gets
+        // short of `!important` — which this engine does not model at all.
+        let css = "#a, #b, #c, #d { width: 400px; } .wide { width: 500px; }";
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = style_tree(&dom, &sheet);
+        let by_id = elements(&styled);
+
+        assert_eq!(by_id[0].px("width", 0.0), Some(400.0)); // no attribute: the rule stands
+        assert_eq!(by_id[1].px("width", 0.0), Some(120.0));
+        assert_eq!(by_id[2].px("width", 0.0), Some(200.0)); // `var()` resolves inline too
+                                                            // A declaration the parser cannot read must not swallow the ones after
+                                                            // it — a page's inline styles are often machine-written and untidy.
+        assert_eq!(by_id[3].px("width", 0.0), Some(300.0));
+    }
+
+    #[test]
     fn hover_applies_to_the_element_and_what_it_sits_inside() {
         let html = "<body><a><span>inner</span></a><a>other</a></body>";
         let css = "a { color: #000000; } a:hover { color: #ff0000; }";
         let mut dom = crate::html::parse(html.to_string());
         number_elements(&mut dom, &mut 0);
         let sheet = crate::css::parse(css.to_string());
-        let black = Value::ColorValue(crate::css::Color { r: 0, g: 0, b: 0, a: 255 });
-        let red = Value::ColorValue(crate::css::Color { r: 255, g: 0, b: 0, a: 255 });
+        let black = Value::ColorValue(crate::css::Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        });
+        let red = Value::ColorValue(crate::css::Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        });
 
         let id_of = |node: &Node| match &node.node_type {
             NodeType::Element(e) => e.node_id,
@@ -826,6 +1134,24 @@ mod tests {
     }
 
     #[test]
+    fn is_where_and_not_match_whole_selectors() {
+        let html =
+            "<body><nav><a class=x>1</a></nav><p><a class=x>2</a><a class=y>3</a></p></body>";
+        // `:not(nav a)` looks up the tree from the element itself, and
+        // `:where()` loses to a plain class however late it comes.
+        let css = "a:not(nav a) { color: #ff0000; }                    :is(nav, .nope) > a { color: #00ff00; }                    .y { background-color: #0000ff; }                    p :where(.y) { background-color: #ff0000; }";
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = style_tree(&dom, &sheet);
+        let kids = elements(&styled); // the root is <body> itself here
+        let (nav, p) = (kids[0], kids[1]);
+        let rgb = |r, g, b| Some(Value::ColorValue(crate::css::Color { r, g, b, a: 255 }));
+        assert_eq!(elements(nav)[0].value("color"), rgb(0, 255, 0));
+        assert_eq!(elements(p)[0].value("color"), rgb(255, 0, 0));
+        assert_eq!(elements(p)[1].value("background-color"), rgb(0, 0, 255));
+    }
+
+    #[test]
     fn attribute_selectors_match_on_value() {
         let html = "<body><input type=\"text\" name=\"q\">                    <input type=\"submit\">                    <a href=\"https://a.com/x.pdf\" rel=\"nofollow noopener\">link</a></body>";
         let css = "[type=text] { color: #ff0000; }                    input[type=\"submit\"] { color: #00ff00; }                    a[href$=\".pdf\"] { color: #0000ff; }                    a[rel~=noopener] { background-color: #111111; }                    [name] { padding: 4px; }                    a[href^=\"ftp\"] { color: #ffffff; }";
@@ -834,27 +1160,38 @@ mod tests {
         let styled = style_tree(&dom, &sheet);
         let fields = elements(&styled);
         let color = |i: usize| fields[i].value("color");
-        let rgb = |r, g, b| {
-            Some(Value::ColorValue(crate::css::Color { r, g, b, a: 255 }))
-        };
+        let rgb = |r, g, b| Some(Value::ColorValue(crate::css::Color { r, g, b, a: 255 }));
 
         assert_eq!(color(0), rgb(255, 0, 0)); // [type=text]
         assert_eq!(color(1), rgb(0, 255, 0)); // input[type="submit"]
         assert_eq!(color(2), rgb(0, 0, 255)); // suffix match on href
-        // `~=` matches one word of a space-separated list.
+                                              // `~=` matches one word of a space-separated list.
         assert_eq!(
             fields[2].value("background-color"),
-            Some(Value::ColorValue(crate::css::Color { r: 17, g: 17, b: 17, a: 255 }))
+            Some(Value::ColorValue(crate::css::Color {
+                r: 17,
+                g: 17,
+                b: 17,
+                a: 255
+            }))
         );
         // Presence alone, and a prefix that does not match.
-        assert_eq!(fields[0].value("padding"), Some(Value::Length(4.0, Unit::Px)));
-        assert_eq!(fields[1].value("padding"), None);
+        assert_eq!(
+            fields[0].value("padding-left"),
+            Some(Value::Length(4.0, Unit::Px))
+        );
+        assert_eq!(fields[1].value("padding-left"), None);
     }
 
     #[test]
     fn html_attributes_style_elements_but_css_still_wins() {
         let html = "<body><td bgcolor=\"#ff6600\" width=\"85%\">head</td>                    <td bgcolor=\"ff6600\">bare hex</td>                    <td bgcolor=\"#ff6600\" class=\"over\">overridden</td></body>";
-        let orange = Value::ColorValue(crate::css::Color { r: 255, g: 102, b: 0, a: 255 });
+        let orange = Value::ColorValue(crate::css::Color {
+            r: 255,
+            g: 102,
+            b: 0,
+            a: 255,
+        });
 
         let dom = crate::html::parse(html.to_string());
         let sheet = crate::css::parse(".over { background-color: #000000; }".to_string());
@@ -871,7 +1208,12 @@ mod tests {
         // A stylesheet beats a presentation hint.
         assert_eq!(
             cells[2].value("background-color"),
-            Some(Value::ColorValue(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }))
+            Some(Value::ColorValue(crate::css::Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255
+            }))
         );
     }
 
@@ -884,16 +1226,62 @@ mod tests {
         let styled = style_tree(&dom, &sheet);
         let body = elements(&styled)[0];
 
-        let red = Value::ColorValue(crate::css::Color { r: 255, g: 0, b: 0, a: 255 });
-        let green = Value::ColorValue(crate::css::Color { r: 0, g: 255, b: 0, a: 255 });
+        let red = Value::ColorValue(crate::css::Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        });
+        let green = Value::ColorValue(crate::css::Color {
+            r: 0,
+            g: 255,
+            b: 0,
+            a: 255,
+        });
         // Defined on :root, used several levels down.
         let cards = elements(body);
         assert_eq!(cards[0].value("color"), Some(red));
-        assert_eq!(cards[0].value("padding"), Some(Value::Length(12.0, Unit::Px)));
+        assert_eq!(
+            cards[0].value("padding-top"),
+            Some(Value::Length(12.0, Unit::Px))
+        );
         // A missing variable falls back to the value after the comma.
         assert_eq!(cards[1].value("color"), Some(green));
         // With no fallback the declaration is dropped, not left as raw text.
         assert_eq!(cards[2].value("color"), None);
+    }
+
+    #[test]
+    fn custom_properties_chain_and_survive_cycles() {
+        // A token-based design system: every token is defined in terms of the
+        // one above it, so one level of substitution resolves none of them.
+        let css = ":root { --hue: #ff0000; --brand: var(--hue); --button-bg: var(--brand);                    --a: var(--b); --b: var(--a); --pair: 1px 2px; }                    .deep { color: var(--button-bg); }                    .cyclic { color: var(--a, #00ff00); }                    .nested-fallback { color: var(--gone, var(--brand)); }                    .commas { color: var(--gone, rgb(0, 0, 255)); }                    .stream { margin: var(--pair); }";
+        let html = "<html><body><div class=\"deep\">a</div><div class=\"cyclic\">b</div>                    <div class=\"nested-fallback\">c</div><div class=\"commas\">d</div>                    <div class=\"stream\">e</div></body></html>";
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = style_tree(&dom, &sheet);
+        let kids = elements(elements(&styled)[0]);
+        let color = |r, g, b| Some(Value::ColorValue(crate::css::Color { r, g, b, a: 255 }));
+
+        // Three levels deep.
+        assert_eq!(kids[0].value("color"), color(255, 0, 0));
+        // A cycle is invalid at computed-value time, so the fallback stands —
+        // and getting here at all means it did not overflow the stack.
+        assert_eq!(kids[1].value("color"), color(0, 255, 0));
+        // The fallback may itself be a var().
+        assert_eq!(kids[2].value("color"), color(255, 0, 0));
+        // Commas inside a nested function are not the fallback separator.
+        assert_eq!(kids[3].value("color"), color(0, 0, 255));
+        // A custom property holds a token stream, not a single value, and a
+        // shorthand that arrives through one still expands to its longhands.
+        assert_eq!(
+            kids[4].value("margin-top"),
+            Some(Value::Length(1.0, Unit::Px))
+        );
+        assert_eq!(
+            kids[4].value("margin-left"),
+            Some(Value::Length(2.0, Unit::Px))
+        );
     }
 
     #[test]
@@ -910,15 +1298,24 @@ mod tests {
         };
 
         // `+` is the element immediately after; `~` is any element after.
-        assert_eq!(colored("h2 + p { color: red; }"), [false, true, false, false]);
-        assert_eq!(colored("h2 ~ p { color: red; }"), [false, true, true, false]);
+        assert_eq!(
+            colored("h2 + p { color: red; }"),
+            [false, true, false, false]
+        );
+        assert_eq!(
+            colored("h2 ~ p { color: red; }"),
+            [false, true, true, false]
+        );
         // The chain above the sibling still has to hold.
         assert_eq!(
             colored("main h2 + p { color: red; }"),
             [false, false, false, false]
         );
         // Nothing precedes the first child.
-        assert_eq!(colored("p + h2 { color: red; }"), [false, false, false, false]);
+        assert_eq!(
+            colored("p + h2 { color: red; }"),
+            [false, false, false, false]
+        );
     }
 
     #[test]
@@ -936,14 +1333,23 @@ mod tests {
 
         assert_eq!(nth("li:first-child { color: red; }"), [true, false, false]);
         assert_eq!(nth("li:last-child { color: red; }"), [false, false, true]);
-        assert_eq!(nth("li:nth-child(odd) { color: red; }"), [true, false, true]);
+        assert_eq!(
+            nth("li:nth-child(odd) { color: red; }"),
+            [true, false, true]
+        );
         assert_eq!(nth("li:nth-child(2) { color: red; }"), [false, true, false]);
         // `-n+2` is the first two, and stops rather than wrapping.
-        assert_eq!(nth("li:nth-child(-n+2) { color: red; }"), [true, true, false]);
+        assert_eq!(
+            nth("li:nth-child(-n+2) { color: red; }"),
+            [true, true, false]
+        );
         assert_eq!(nth("li:not(.skip) { color: red; }"), [true, false, true]);
         assert_eq!(nth("li:only-child { color: red; }"), [false, false, false]);
         // Whitespace between the tags is a text node, and must not count.
-        assert_eq!(nth("li:nth-of-type(3) { color: red; }"), [false, false, true]);
+        assert_eq!(
+            nth("li:nth-of-type(3) { color: red; }"),
+            [false, false, true]
+        );
     }
 
     #[test]

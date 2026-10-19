@@ -18,8 +18,11 @@
 //! styled tree -> layout boxes -> pixels.
 
 pub mod anim;
+pub mod counters;
 pub mod css;
 pub mod dom;
+/// The HTML named character reference table, generated from the spec.
+mod entities;
 pub mod html;
 pub mod js;
 pub mod layout;
@@ -28,9 +31,10 @@ pub mod resource;
 pub mod style;
 pub mod svg;
 pub mod text;
+pub mod woff2;
 
 pub use css::Color;
-pub use layout::{ElementRect, LinkArea, TextRun};
+pub use layout::{Cursor, ElementRect, LinkArea, TextRun};
 pub use paint::Canvas;
 pub use resource::{DecodedImage, KeyValueStore, ResourceLoader};
 
@@ -62,6 +66,9 @@ pub struct Page {
     /// Whether any rule used `:hover`. Without this the embedder would repaint
     /// on every mouse move for pages that do not react to the cursor at all.
     pub uses_hover: bool,
+    /// Whether anything on the page is `position: sticky`, and so whether the
+    /// band the embedder is holding survives a scroll. See `set_scroll`.
+    pub uses_sticky: bool,
     /// Whether a transition is still running, and so whether another frame is
     /// worth drawing. An idle page answers `false` and the embedder can rest.
     pub animating: bool,
@@ -95,6 +102,11 @@ pub struct Document {
     hovered: style::HoverChain,
     /// Properties mid-transition, and the clock they are moving against.
     anim: anim::Animator,
+    /// The first document row the reader can see, for `position: sticky`.
+    scroll_top: f32,
+    /// Typefaces the page shipped through `@font-face`, under the names it gave
+    /// them. Fetched when the stylesheet changes, not once per render.
+    web_fonts: Vec<(String, LoadedFont)>,
     pub console: Vec<String>,
 }
 
@@ -105,7 +117,7 @@ impl Document {
         css_source: &str,
         loader: std::rc::Rc<dyn ResourceLoader>,
     ) -> Document {
-        Document::load_hosted(html_source, css_source, Some(loader), None)
+        Document::load_hosted(html_source, css_source, Some(loader), None, None)
     }
 
     /// Parse `html` and run its scripts with whatever host services are available.
@@ -115,6 +127,7 @@ impl Document {
         css_source: &str,
         loader: Option<std::rc::Rc<dyn ResourceLoader>>,
         store: Option<std::rc::Rc<dyn KeyValueStore>>,
+        session: Option<std::rc::Rc<dyn KeyValueStore>>,
     ) -> Document {
         let mut doc = Document::prepare(html_source, css_source);
         if let Some(loader) = loader {
@@ -122,6 +135,9 @@ impl Document {
         }
         if let Some(store) = store {
             doc.interp.set_store(store);
+        }
+        if let Some(session) = session {
+            doc.interp.set_session_store(session);
         }
         doc.run_initial_scripts();
         doc
@@ -148,6 +164,8 @@ impl Document {
             sheet: None,
             hovered: Default::default(),
             anim: Default::default(),
+            scroll_top: 0.0,
+            web_fonts: Vec::new(),
             console: Vec::new(),
         };
         doc.assign_node_ids();
@@ -298,6 +316,13 @@ impl Document {
         self.anim.set_time(now);
     }
 
+    /// Turn page animation on or off, following the embedder's reduced-motion
+    /// preference. Off holds each animation at its fill state rather than
+    /// freezing the clock mid-cycle, so nothing is left half-drawn.
+    pub fn set_animations_enabled(&mut self, enabled: bool) {
+        self.anim.set_enabled(enabled);
+    }
+
     pub fn set_hover(&mut self, node_id: Option<usize>) -> bool {
         let chain = match node_id {
             Some(id) => ancestor_chain(&self.root, id),
@@ -311,6 +336,17 @@ impl Document {
     /// Highlight every occurrence of `query` on the next render; `None` clears it.
     pub fn set_find(&mut self, query: Option<String>) {
         self.find = query.filter(|q| !q.is_empty());
+    }
+
+    /// The first document row the reader can see.
+    ///
+    /// Layout is otherwise independent of scrolling — the engine draws a whole
+    /// document and the embedder moves through it — and this is the exception:
+    /// `position: sticky` is the one thing whose position depends on how far
+    /// down the page you are. An embedder that never calls this gets the top of
+    /// the page, where a sticky box sits at its natural place anyway.
+    pub fn set_scroll(&mut self, top: f32) {
+        self.scroll_top = top.max(0.0);
     }
 
     /// Which field has focus, so the embedder can act on it (submit, say).
@@ -383,10 +419,13 @@ impl Document {
     }
 
     fn run_initial_scripts(&mut self) {
-        let mut source = String::new();
-        collect_script_text(&self.root, &mut source);
-        if !source.trim().is_empty() {
-            match js::lexer::tokenize(&source).and_then(js::parser::parse) {
+        let mut sources = Vec::new();
+        collect_script_text(&self.root, &mut sources);
+        // Each `<script>` is its own program, as in a browser: one that fails to
+        // parse or throws stops only itself, and the globals the earlier ones
+        // defined are still there for the next.
+        for source in sources.iter().filter(|s| !s.trim().is_empty()) {
+            match js::lexer::tokenize(source).and_then(js::parser::parse) {
                 Ok(program) => self.interp.run(&program),
                 Err(e) => self.interp.out.errors.push(format!("SyntaxError: {e}")),
             }
@@ -405,6 +444,24 @@ impl Document {
     /// Run a handler and apply everything it changed.
     fn dispatch_event(&mut self, node_id: usize, event: &str) -> bool {
         if !self.interp.dispatch(node_id, event) {
+            return false;
+        }
+        self.absorb_script_output();
+        self.run_timers();
+        true
+    }
+
+    /// Deliver a `storage` event: another document wrote to a `localStorage`
+    /// area this one shares. Returns whether any handler ran, so the embedder
+    /// knows whether this page needs repainting.
+    pub fn storage_event(
+        &mut self,
+        key: Option<&str>,
+        old: Option<&str>,
+        new: Option<&str>,
+        url: &str,
+    ) -> bool {
+        if !self.interp.dispatch_storage_event(key, old, new, url) {
             return false;
         }
         self.absorb_script_output();
@@ -588,6 +645,9 @@ const USER_AGENT_CSS: &str = "
     img { display: inline-block; }
     table { display: table; }
     pre { white-space: pre; }
+    /* Code is monospace unless the page says otherwise — the UA stylesheet is
+       what makes that true, and `font-family` can act on it now. */
+    code, pre, kbd, samp, tt { font-family: monospace; }
     td, th { display: block; padding: 6px; }
     input, textarea, select { background: #ffffff; color: #111111; padding: 7px;
         border-radius: 4px; width: 260px; }
@@ -649,6 +709,13 @@ pub(crate) struct LoadedFont {
 }
 
 impl LoadedFont {
+    pub(crate) fn new(bytes: Vec<u8>) -> LoadedFont {
+        LoadedFont {
+            bytes,
+            raster: std::cell::OnceCell::new(),
+        }
+    }
+
     /// This font's rasterizer, parsed on first use. `None` if the bytes are not
     /// a font this can read — which is as good as a font covering nothing.
     pub(crate) fn raster(&self) -> Option<&Font> {
@@ -691,7 +758,10 @@ impl Engine {
         // See [`LoadedFont`] for why that matters more than it sounds.
         let fonts = fonts
             .into_iter()
-            .map(|bytes| LoadedFont { bytes, raster: std::cell::OnceCell::new() })
+            .map(|bytes| LoadedFont {
+                bytes,
+                raster: std::cell::OnceCell::new(),
+            })
             .collect();
         Engine { fonts }
     }
@@ -772,7 +842,7 @@ impl Engine {
         // Cascade order (later wins on ties):
         // UA stylesheet < linked stylesheets < page <style> < caller CSS.
         let mut source = USER_AGENT_CSS.to_string();
-        collect_linked_css(root, loader, &mut source);
+        collect_linked_css(root, loader, width, height, &mut source);
         source.push('\n');
         collect_style_text(root, &mut source);
         source.push('\n');
@@ -788,6 +858,10 @@ impl Engine {
                 .rules
                 .retain(|rule| css::media_matches(rule.media.as_deref(), width, height));
             let index = style::RuleIndex::build(&parsed);
+            // The page's own typefaces, fetched once per sheet rather than per
+            // render — a font file is the largest subresource on many pages and
+            // nothing about it changes between frames.
+            doc.web_fonts = load_web_fonts(&parsed.font_faces, loader);
             doc.sheet = Some((key, parsed, index));
         }
         let (_, stylesheet, rule_index) = doc.sheet.as_ref().expect("just cached");
@@ -797,20 +871,24 @@ impl Engine {
         let uses_hover = stylesheet
             .rules
             .iter()
-            .any(|rule| {
-                rule.selectors.iter().any(|s| {
-                    s.parts
-                        .iter()
-                        .any(|p| p.simple.pseudos.contains(&css::Pseudo::Hover))
-                })
-            });
+            .any(|rule| rule.selectors.iter().any(css::Selector::mentions_hover));
+        // Whether anything on the page is `position: sticky`. Layout is
+        // scroll-independent for every other page, so the embedder can keep
+        // reusing the band it has while scrolling — and must not, here, because
+        // where a sticky box sits is a function of how far down the page you
+        // are. Same bargain as `uses_hover`: the pages that need the extra work
+        // say so, and the rest pay nothing.
+        let uses_sticky = stylesheet.rules.iter().any(|rule| {
+            rule.declarations.iter().any(|d| {
+                d.name == "position" && matches!(&d.value, css::Value::Keyword(k) if k == "sticky")
+            })
+        });
         let style_root =
             style::style_tree_animated(root, stylesheet, rule_index, &doc.hovered, &mut doc.anim);
 
         // Fetch + decode every <img> up front so layout knows their sizes.
         let mut images = ImageMap::new();
         collect_and_load_images(root, loader, &mut images);
-        rasterize_inline_svg(root, &mut images);
         // `background-image: url(...)` is a style, not a DOM attribute, so it
         // can only be found by walking the *styled* tree, once the cascade has
         // matched rules to elements — batched the same way `<img src>` is.
@@ -821,24 +899,49 @@ impl Engine {
         viewport.content.height = height;
 
         // Shaping faces are built per render; they borrow the stored font bytes.
+        // The page's own `@font-face` files come first, so a site asking for the
+        // typeface it shipped gets it rather than whatever the system happens to
+        // call by the same name.
+        let web = &doc.web_fonts;
+        let web_faces: Vec<Option<rustybuzz::Face>> = web
+            .iter()
+            .map(|(_, f)| rustybuzz::Face::from_slice(&f.bytes, 0))
+            .collect();
         let faces: Vec<Option<rustybuzz::Face>> = self
             .fonts
             .iter()
             .map(|f| rustybuzz::Face::from_slice(&f.bytes, 0))
             .collect();
-        let entries: Vec<FontEntry> = self
-            .fonts
-            .iter()
-            .zip(faces.iter())
-            .filter_map(|(f, face)| face.as_ref().map(|shaper| FontEntry::new(f, shaper)))
-            .collect();
+        let entries: Vec<FontEntry> =
+            web.iter()
+                .zip(web_faces.iter())
+                .filter_map(|((family, f), face)| {
+                    face.as_ref()
+                        .map(|shaper| FontEntry::named(f, shaper, family))
+                })
+                .chain(
+                    self.fonts.iter().zip(faces.iter()).filter_map(|(f, face)| {
+                        face.as_ref().map(|shaper| FontEntry::new(f, shaper))
+                    }),
+                )
+                .collect();
         let fonts = if entries.is_empty() {
             None
         } else {
             Some(FontSet { entries })
         };
 
-        let layout_root = layout::layout_tree(&style_root, viewport, fonts.as_ref(), &images);
+        // Inline SVG is rasterized once the fonts exist, because an `<svg>` may
+        // contain `<text>` and that has to shape with the page's own faces.
+        rasterize_inline_svg(root, &mut images, fonts.as_ref());
+
+        let layout_root = layout::layout_tree_scrolled(
+            &style_root,
+            viewport,
+            fonts.as_ref(),
+            &images,
+            doc.scroll_top,
+        );
         let doc_height = layout::content_bottom(&layout_root).max(height);
         // Only the band the caller asked for is painted. `band` is `None` for a
         // caller that wants the page whole — a screenshot, or an embedder that
@@ -881,6 +984,7 @@ impl Engine {
             find_matches,
             text_runs,
             uses_hover,
+            uses_sticky,
             animating: doc.anim.is_active(),
         }
     }
@@ -900,15 +1004,77 @@ pub fn is_text_field(tag: &str) -> bool {
 /// ponytail: `@import` inside a fetched sheet is not followed, so a site that
 /// splits its CSS that way still renders under-styled. One more pass over the
 /// parsed sheet would fix it.
-fn collect_linked_css(node: &Node, loader: &dyn ResourceLoader, out: &mut String) {
+fn collect_linked_css(
+    node: &Node,
+    loader: &dyn ResourceLoader,
+    width: f32,
+    height: f32,
+    out: &mut String,
+) {
     let mut hrefs = Vec::new();
-    collect_stylesheet_hrefs(node, &mut hrefs);
-    for bytes in loader.load_all(&hrefs).into_iter().flatten() {
-        if let Ok(text) = String::from_utf8(bytes) {
-            out.push('\n');
-            expand_imports(&text, loader, out, 0);
-        }
+    collect_stylesheet_hrefs(node, width, height, &mut hrefs);
+    for (href, bytes) in hrefs.iter().zip(loader.load_all(&hrefs)) {
+        let Some(text) = bytes.and_then(|b| String::from_utf8(b).ok()) else {
+            continue;
+        };
+        out.push('\n');
+        expand_imports(&rebase_urls(&text, href), loader, out, 0);
     }
+}
+
+/// Rewrite every relative `url(...)` in a sheet to sit against the sheet's own
+/// address rather than against the page's.
+///
+/// A stylesheet's `url()`s are relative to *it*, not to the document that
+/// linked it: a font beside `/static/site.css` is `/static/font.woff2`, and
+/// resolving it against the page asks for `/font.woff2` and gets nothing. The
+/// engine has no URL type and the loader resolves against the page, so the
+/// sheet's own directory is pasted on here — which is all "relative to the
+/// sheet" amounts to for the forms sheets actually use.
+///
+/// ponytail: no `../` climbing. A sheet that reaches up out of its own
+/// directory still resolves wrongly; that needs real path normalisation, and
+/// nothing in the survey corpus does it.
+fn rebase_urls(text: &str, sheet_url: &str) -> String {
+    let Some(dir) = sheet_url.rfind('/').map(|cut| &sheet_url[..=cut]) else {
+        return text.to_string(); // no directory to be relative to
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("url(") {
+        let (before, after) = rest.split_at(open + 4);
+        out.push_str(before);
+        let Some(close) = after.find(')') else { break };
+        let (inside, tail) = after.split_at(close);
+        let trimmed = inside.trim();
+        // A quote is syntax, not part of the URL, and has to go back around
+        // whatever this writes.
+        let quote = trimmed.chars().next().filter(|c| *c == '"' || *c == '\'');
+        let url = trimmed.trim_matches(|c| c == '"' || c == '\'').trim();
+        if let Some(q) = quote {
+            out.push(q);
+        }
+        if is_relative_url(url) {
+            out.push_str(dir);
+        }
+        out.push_str(url);
+        if let Some(q) = quote {
+            out.push(q);
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether a URL needs a base to mean anything. One already absolute, or rooted
+/// at the host, or carrying its own data, is left exactly as written.
+fn is_relative_url(url: &str) -> bool {
+    !url.is_empty()
+        && !url.starts_with('/')
+        && !url.starts_with('#')
+        && !url.contains("://")
+        && !url.starts_with("data:")
 }
 
 /// Append a sheet, with anything it `@import`s placed ahead of it.
@@ -931,6 +1097,47 @@ fn expand_imports(text: &str, loader: &dyn ResourceLoader, out: &mut String, dep
         }
     }
     out.push_str(text);
+}
+
+/// Fetch every `@font-face` file the sheet declared, in one batch.
+///
+/// A face whose file will not download, or will not parse as a font, is simply
+/// absent: `font-family` then falls through the embedder's chain, which is what
+/// a page looks like today and no worse.
+///
+/// `.woff2` is unpacked back into a plain sfnt on the way in (see
+/// [`woff2`]), which is what makes this work on real sites at all: nearly
+/// every page that ships a typeface ships only WOFF2.
+fn load_web_fonts(
+    faces: &[css::FontFace],
+    loader: &dyn ResourceLoader,
+) -> Vec<(String, LoadedFont)> {
+    if faces.is_empty() {
+        return Vec::new();
+    }
+    // One round trip for every candidate file, rather than one per face in
+    // turn — the loader batches, and a page declares a dozen of these.
+    let urls: Vec<String> = faces.iter().flat_map(|f| f.srcs.iter().cloned()).collect();
+    let mut bytes = loader.load_all(&urls).into_iter();
+    let mut loaded = Vec::new();
+    for face in faces {
+        let candidates: Vec<Option<Vec<u8>>> = bytes.by_ref().take(face.srcs.len()).collect();
+        // The first file that turns out to be a font wins, which is how `src`'s
+        // preference order is meant to work.
+        if let Some(usable) = candidates.into_iter().flatten().find_map(readable_font) {
+            loaded.push((face.family.clone(), LoadedFont::new(usable)));
+        }
+    }
+    loaded
+}
+
+/// A downloaded font file as bytes the shaper can read, unpacking WOFF2 first.
+/// `None` for anything that is not a font this engine understands.
+fn readable_font(bytes: Vec<u8>) -> Option<Vec<u8>> {
+    let bytes = woff2::to_sfnt(&bytes).unwrap_or(bytes);
+    rustybuzz::Face::from_slice(&bytes, 0)
+        .is_some()
+        .then_some(bytes)
 }
 
 /// URLs from `@import "a.css";` and `@import url(a.css) screen;`.
@@ -962,16 +1169,20 @@ fn import_urls(text: &str) -> Vec<String> {
     urls
 }
 
-fn collect_stylesheet_hrefs(node: &Node, out: &mut Vec<String>) {
+/// A sheet whose `media` does not match the viewport (`print`, a dark-mode
+/// sheet in light mode) is not fetched at all; a viewport change re-collects.
+fn collect_stylesheet_hrefs(node: &Node, width: f32, height: f32, out: &mut Vec<String>) {
     if let NodeType::Element(ref e) = node.node_type {
-        if e.tag_name == "link" && is_stylesheet(e) {
+        let media = e.attributes.get("media").map(String::as_str);
+        let media = media.filter(|m| !m.trim().is_empty()); // `media=""` means all
+        if e.tag_name == "link" && is_stylesheet(e) && css::media_matches(media, width, height) {
             if let Some(href) = e.attributes.get("href").filter(|h| !h.is_empty()) {
                 out.push(href.clone());
             }
         }
     }
     for child in &node.children {
-        collect_stylesheet_hrefs(child, out);
+        collect_stylesheet_hrefs(child, width, height, out);
     }
 }
 
@@ -1045,19 +1256,19 @@ fn collect_image_srcs(node: &Node, out: &mut Vec<String>) {
 /// An inline SVG is a picture written in the page rather than fetched, so it
 /// needs no loader — but from layout and paint's point of view it is an image
 /// like any other, and giving it a key in the same map is what lets it be one.
-fn rasterize_inline_svg(node: &Node, out: &mut ImageMap) {
+fn rasterize_inline_svg(node: &Node, out: &mut ImageMap, fonts: Option<&text::FontSet>) {
     if let NodeType::Element(ref e) = node.node_type {
         if e.tag_name == "svg" {
             let source = svg_source(node);
             let (w, h) = svg::intrinsic_size(&source);
-            if let Some(image) = svg::rasterize(&source, w, h) {
+            if let Some(image) = svg::rasterize_with(&source, w, h, fonts) {
                 out.insert(inline_svg_key(node), image);
             }
             return; // its children are its own markup, not more images
         }
     }
     for child in &node.children {
-        rasterize_inline_svg(child, out);
+        rasterize_inline_svg(child, out, fonts);
     }
 }
 
@@ -1171,7 +1382,6 @@ fn node_at<'a>(root: &'a mut Node, path: &[usize]) -> Option<&'a mut Node> {
     Some(current)
 }
 
-/// Gather the text inside every `<script>` element into one JS source string.
 /// A cheap content hash, to notice when a page's CSS actually changes.
 fn hash_of(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1278,20 +1488,38 @@ pub fn percent_encode(text: &str) -> String {
     out
 }
 
-fn collect_script_text(node: &Node, out: &mut String) {
+/// The text of every inline classic or module `<script>`, one entry per
+/// element. Data blocks (`application/json`, `ld+json`, `importmap`,
+/// `text/template` …) are not script and are left out.
+fn collect_script_text(node: &Node, out: &mut Vec<String>) {
     if let NodeType::Element(ref e) = node.node_type {
-        if e.tag_name == "script" && !e.attributes.contains_key("src") {
+        if e.tag_name == "script" && !e.attributes.contains_key("src") && is_js_type(e) {
+            let mut text = String::new();
             for child in &node.children {
                 if let NodeType::Text(ref t) = child.node_type {
-                    out.push_str(t);
-                    out.push('\n');
+                    text.push_str(t);
                 }
             }
+            out.push(text);
         }
     }
     for child in &node.children {
         collect_script_text(child, out);
     }
+}
+
+/// No `type`, an empty one, `module`, or a JavaScript MIME type
+/// (`text/javascript`, `application/ecmascript; charset=…`).
+fn is_js_type(element: &dom::ElementData) -> bool {
+    let kind = element
+        .attributes
+        .get("type")
+        .map(|t| t.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    kind.is_empty()
+        || kind == "module"
+        || kind.contains("javascript")
+        || kind.contains("ecmascript")
 }
 
 /// Append a node to <body> (or the root if there is none).
@@ -1362,8 +1590,13 @@ mod tests {
         assert_eq!(rgb(whole.pixels[150 * whole.width + 10]), (0, 255, 0));
 
         let mut doc = super::Document::load(html, css);
-        let band =
-            engine.render_band(&mut doc, 50.0, 100.0, Some((100.0, 100.0)), &crate::resource::NullLoader);
+        let band = engine.render_band(
+            &mut doc,
+            50.0,
+            100.0,
+            Some((100.0, 100.0)),
+            &crate::resource::NullLoader,
+        );
         assert_eq!((band.canvas.width, band.canvas.height), (50, 100));
         // The whole page is still measured, so a scrollbar knows how long it is.
         assert_eq!(band.doc_height, 300.0);
@@ -1384,8 +1617,13 @@ mod tests {
         );
         // Scrolled far past the bottom: clamped to the last screenful rather
         // than painting nothing at all.
-        let band =
-            engine.render_band(&mut doc, 50.0, 100.0, Some((9000.0, 100.0)), &crate::resource::NullLoader);
+        let band = engine.render_band(
+            &mut doc,
+            50.0,
+            100.0,
+            Some((9000.0, 100.0)),
+            &crate::resource::NullLoader,
+        );
         assert_eq!(band.canvas.height, 100);
         assert_eq!(band.band_top, 200.0);
         let px = band.canvas.pixels[50 * band.canvas.width + 10];
@@ -1401,7 +1639,10 @@ mod tests {
         let canvas = engine.render("<html><body>hello</body></html>", "", 80.0, 40.0);
         assert_eq!(canvas.width, 80);
         // Nothing could be drawn with it, so the page is blank rather than a panic.
-        assert!(canvas.pixels.iter().all(|p| p.r == 255 && p.g == 255 && p.b == 255));
+        assert!(canvas
+            .pixels
+            .iter()
+            .all(|p| p.r == 255 && p.g == 255 && p.b == 255));
     }
 
     #[test]
@@ -1508,6 +1749,94 @@ mod tests {
     }
 
     #[test]
+    fn a_one_value_padding_beats_the_user_agent_list_indent() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><ul><li>x</li></ul></body>",
+            "body { margin: 0 } ul { padding: 0; margin: 0 }              li { height: 10px; background: #ff0000 }",
+            60.0,
+            20.0,
+        );
+        let px = canvas.pixels[5 * canvas.width + 5];
+        // The UA's `padding-left: 40px` would leave x=5 white.
+        assert_eq!((px.r, px.g, px.b), (255, 0, 0));
+    }
+
+    #[test]
+    fn each_border_side_takes_its_own_shorthand() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=a></div><div id=b></div></body>",
+            "body { margin: 0 }              #a { width: 20px; height: 20px; border: 4px solid #ff0000;                   border-bottom: none; border-left: 2px solid #0000ff; }              #b { width: 20px; height: 10px; border-top: 4px solid #ff0000; }              div#b { border: 0; }",
+            40.0,
+            40.0,
+        );
+        let rgb = |x: usize, y: usize| {
+            let c = canvas.pixels[y * canvas.width + x];
+            (c.r, c.g, c.b)
+        };
+        assert_eq!(rgb(1, 10), (0, 0, 255)); // left: its own width and colour
+        assert_eq!(rgb(10, 1), (255, 0, 0)); // top: from `border`
+        assert_eq!(rgb(24, 10), (255, 0, 0)); // right: x 22..26
+                                              // No bottom border, so #a ends at y=24 and #b starts there; and the
+                                              // later `border: 0` removed the top border #b set per side.
+        assert_eq!(rgb(10, 25), (255, 255, 255));
+    }
+
+    #[test]
+    fn a_linked_sheet_applies_only_when_its_media_matches() {
+        struct Sheets;
+        impl super::ResourceLoader for Sheets {
+            fn load(&self, url: &str) -> Option<Vec<u8>> {
+                let color = match url {
+                    "print.css" => "#ff0000",
+                    "wide.css" => "#0000ff",
+                    _ => "#00ff00",
+                };
+                Some(format!("#a {{ background: {color} }}").into_bytes())
+            }
+        }
+        let engine = super::Engine::shapes_only();
+        let mut doc = super::Document::load(
+            "<link rel=stylesheet href=all.css media=\"\">             <link rel=stylesheet href=print.css media=print>             <link rel=stylesheet href=wide.css media=\"(min-width: 600px)\">             <div id=a></div>",
+            "body { margin: 0 } #a { height: 10px }",
+        );
+        let mut rgb = |width: f32| {
+            let page = engine.render_document(&mut doc, width, 20.0, &Sheets);
+            let c = page.canvas.pixels[5 * page.canvas.width + 5];
+            (c.r, c.g, c.b)
+        };
+        assert_eq!(rgb(400.0), (0, 255, 0)); // print never applies on screen
+        assert_eq!(rgb(800.0), (0, 0, 255)); // the wide sheet, once it is wide
+    }
+
+    #[test]
+    fn each_script_runs_alone_and_data_blocks_are_not_run() {
+        let doc = super::Document::load(
+            "<script type=\"application/ld+json\">{\"@context\": \"x\"}</script>             <script>var a = 1; console.log('first');</script>             <script>this is not javascript</script>             <script type=\"text/javascript\">console.log('a=' + a);</script>             <script type=importmap>{\"imports\": {}}</script>",
+            "",
+        );
+        // The broken script stops only itself, and the globals of the first
+        // are there for the last. The JSON blocks are never parsed as JS.
+        assert!(
+            doc.console.contains(&"first".to_string()),
+            "{:?}",
+            doc.console
+        );
+        assert!(
+            doc.console.contains(&"a=1".to_string()),
+            "{:?}",
+            doc.console
+        );
+        let errors = doc
+            .console
+            .iter()
+            .filter(|l| l.starts_with("[error]"))
+            .count();
+        assert_eq!(errors, 1, "{:?}", doc.console);
+    }
+
+    #[test]
     fn outline_paints_outside_the_border_box_without_changing_its_size() {
         let engine = super::Engine::shapes_only();
         let canvas = engine.render(
@@ -1569,7 +1898,10 @@ mod tests {
             60.0,
         );
         let red = |y: usize| canvas.pixels[y * canvas.width + 5].r == 255;
-        assert!(red(5) && red(35), "content must survive an auto-height wrapper");
+        assert!(
+            red(5) && red(35),
+            "content must survive an auto-height wrapper"
+        );
     }
 
     #[test]
@@ -1593,7 +1925,11 @@ mod tests {
         assert_eq!((at(5, 5).r, at(5, 5).g, at(5, 5).b), (0, 0, 255));
         // Half-opaque black over white is mid grey, give or take rounding.
         let grey = at(5, 35);
-        assert!((120..=136).contains(&grey.r), "expected mid grey, got {}", grey.r);
+        assert!(
+            (120..=136).contains(&grey.r),
+            "expected mid grey, got {}",
+            grey.r
+        );
         assert_eq!(grey.r, grey.b);
     }
 
@@ -1609,11 +1945,16 @@ mod tests {
             100.0,
             100.0,
         );
-        let red = |x: usize, y: usize| canvas.pixels[y * canvas.width + x].r == 255
-            && canvas.pixels[y * canvas.width + x].g == 0;
+        let red = |x: usize, y: usize| {
+            canvas.pixels[y * canvas.width + x].r == 255
+                && canvas.pixels[y * canvas.width + x].g == 0
+        };
         // Centred on (50, 50): 30..70 across, 40..60 down.
         assert!(red(50, 50), "the box should straddle its anchor point");
-        assert!(red(31, 41) && red(68, 58), "corners land where translate put them");
+        assert!(
+            red(31, 41) && red(68, 58),
+            "corners land where translate put them"
+        );
         // ...and nothing is left where it was laid out.
         assert!(!red(85, 65), "the untranslated position must be empty");
     }
@@ -1628,8 +1969,10 @@ mod tests {
             100.0,
             100.0,
         );
-        let red = |x: usize, y: usize| canvas.pixels[y * canvas.width + x].r == 255
-            && canvas.pixels[y * canvas.width + x].g == 0;
+        let red = |x: usize, y: usize| {
+            canvas.pixels[y * canvas.width + x].r == 255
+                && canvas.pixels[y * canvas.width + x].g == 0
+        };
         // 20px at (40,40) doubled about its centre (50,50) covers 30..70.
         assert!(red(50, 50), "the centre stays put");
         assert!(red(32, 32) && red(67, 67), "the box grew to twice its size");
@@ -1649,9 +1992,8 @@ mod tests {
         ids_of(&doc.root, "div", &mut ids);
         let box_id = ids[0];
 
-        let mut draw = |doc: &mut super::Document| {
-            let page =
-                engine.render_document(doc, 40.0, 40.0, &crate::resource::NullLoader);
+        let draw = |doc: &mut super::Document| {
+            let page = engine.render_document(doc, 40.0, 40.0, &crate::resource::NullLoader);
             let px = page.canvas.pixels[5 * page.canvas.width + 5];
             ((px.r, px.g, px.b), page.animating)
         };
@@ -1668,7 +2010,10 @@ mod tests {
         doc.set_time(200.0);
         let (mid, animating) = draw(&mut doc);
         assert!(animating, "still crossing over");
-        assert!(mid.0 > 100 && mid.0 < 160 && mid.2 > 100 && mid.2 < 160, "got {mid:?}");
+        assert!(
+            mid.0 > 100 && mid.0 < 160 && mid.2 > 100 && mid.2 < 160,
+            "got {mid:?}"
+        );
 
         // Past the end: the new colour, and the window may rest.
         doc.set_time(400.0);
@@ -1755,7 +2100,10 @@ mod tests {
              @import   \"/abs/spaced.css\"  screen and (min-width: 40em);
              .rule { color: red }",
         );
-        assert_eq!(urls, ["base.css", "theme.css", "print.css", "/abs/spaced.css"]);
+        assert_eq!(
+            urls,
+            ["base.css", "theme.css", "print.css", "/abs/spaced.css"]
+        );
         // Nothing to import, and a data: sheet is not worth a fetch.
         assert!(super::import_urls("body { color: red }").is_empty());
         assert!(super::import_urls("@import url(data:text/css,body{});").is_empty());
@@ -1774,8 +2122,13 @@ mod tests {
             }
         }
         let mut out = String::new();
-        super::expand_imports("@import \"base.css\";
-p { color: #0000ff }", &Sheets, &mut out, 0);
+        super::expand_imports(
+            "@import \"base.css\";
+p { color: #0000ff }",
+            &Sheets,
+            &mut out,
+            0,
+        );
         let base = out.find("#ff0000").expect("imported rule");
         let own = out.find("#0000ff").expect("the sheet's own rule");
         assert!(base < own, "the import must come first: {out:?}");
@@ -1798,7 +2151,7 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
 
     #[test]
     fn fields_outside_a_form_do_not_submit() {
-        let mut doc = super::Document::load("<input name=\"q\">", "");
+        let doc = super::Document::load("<input name=\"q\">", "");
         let field = first_input(&doc);
         assert_eq!(doc.submit(field), None);
     }
@@ -1825,7 +2178,8 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
 
     #[test]
     fn background_repeat_tiles_the_image_but_no_repeat_paints_it_once() {
-        const RED: &str = r##"<svg width="10" height="10"><rect width="10" height="10" fill="#ff0000"/></svg>"##;
+        const RED: &str =
+            r##"<svg width="10" height="10"><rect width="10" height="10" fill="#ff0000"/></svg>"##;
         let engine = super::Engine::shapes_only();
         let red_at = |canvas: &super::Canvas, x: usize, y: usize| {
             let p = canvas.pixels[y * canvas.width + x];
@@ -1840,8 +2194,14 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
             30.0,
             &FixedImages(&[("red.svg", RED)]),
         );
-        assert!(red_at(&tiled.canvas, 5, 5), "the first tile paints at the box's origin");
-        assert!(red_at(&tiled.canvas, 25, 5), "repeat (the default) tiles across the box");
+        assert!(
+            red_at(&tiled.canvas, 5, 5),
+            "the first tile paints at the box's origin"
+        );
+        assert!(
+            red_at(&tiled.canvas, 25, 5),
+            "repeat (the default) tiles across the box"
+        );
         assert!(red_at(&tiled.canvas, 5, 25), "and down it");
 
         let once = engine.render_page(
@@ -1852,13 +2212,20 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
             30.0,
             &FixedImages(&[("red.svg", RED)]),
         );
-        assert!(red_at(&once.canvas, 5, 5), "still paints once at the origin");
-        assert!(!red_at(&once.canvas, 25, 5), "no-repeat must not tile a second copy");
+        assert!(
+            red_at(&once.canvas, 5, 5),
+            "still paints once at the origin"
+        );
+        assert!(
+            !red_at(&once.canvas, 25, 5),
+            "no-repeat must not tile a second copy"
+        );
     }
 
     #[test]
     fn background_size_and_position_place_the_image_inside_its_box() {
-        const RED: &str = r##"<svg width="10" height="10"><rect width="10" height="10" fill="#ff0000"/></svg>"##;
+        const RED: &str =
+            r##"<svg width="10" height="10"><rect width="10" height="10" fill="#ff0000"/></svg>"##;
         let engine = super::Engine::shapes_only();
         let page = engine.render_page(
             "<body><div id=\"box\"></div></body>",
@@ -1874,15 +2241,22 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
             p.r == 255 && p.g == 0 && p.b == 0
         };
         // A 20x20 image pinned to the bottom-right of a 30x30 box covers 10..30.
-        assert!(!red_at(5, 5), "the top-left corner is outside the sized, positioned image");
+        assert!(
+            !red_at(5, 5),
+            "the top-left corner is outside the sized, positioned image"
+        );
         assert!(red_at(15, 15), "the middle of the box is covered");
-        assert!(red_at(25, 25), "so is the bottom-right corner it was pinned to");
+        assert!(
+            red_at(25, 25),
+            "so is the bottom-right corner it was pinned to"
+        );
     }
 
     #[test]
     fn object_fit_contain_letterboxes_instead_of_stretching() {
         // Wider than it is tall, dropped into a square box.
-        const WIDE: &str = r##"<svg width="20" height="10"><rect width="20" height="10" fill="#0000ff"/></svg>"##;
+        const WIDE: &str =
+            r##"<svg width="20" height="10"><rect width="20" height="10" fill="#0000ff"/></svg>"##;
         let engine = super::Engine::shapes_only();
         let loader = FixedImages(&[("wide.svg", WIDE)]);
 
@@ -1905,11 +2279,20 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
             p.b == 255 && p.r == 0
         };
         // Default `fill` stretches the 20x10 image to fill the whole 20x20 box.
-        assert!(blue_at(&stretched.canvas, 10, 2), "fill stretches to the box's full height");
+        assert!(
+            blue_at(&stretched.canvas, 10, 2),
+            "fill stretches to the box's full height"
+        );
         // `contain` keeps the image's own aspect ratio, so it letterboxes
         // instead — top and bottom stay the canvas's white, not blue.
-        assert!(!blue_at(&contained.canvas, 10, 2), "contain must not stretch past the image's own ratio");
-        assert!(blue_at(&contained.canvas, 10, 10), "the fitted image still covers the box's middle");
+        assert!(
+            !blue_at(&contained.canvas, 10, 2),
+            "contain must not stretch past the image's own ratio"
+        );
+        assert!(
+            blue_at(&contained.canvas, 10, 10),
+            "the fitted image still covers the box's middle"
+        );
     }
 
     #[test]
@@ -1926,8 +2309,14 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
         let at = |x: usize, y: usize| canvas.pixels[y * canvas.width + x];
         let left = at(2, 10);
         let right = at(97, 10);
-        assert!(left.r > 200 && left.b < 60, "the start of the line is red, got {left:?}");
-        assert!(right.b > 200 && right.r < 60, "the end of the line is blue, got {right:?}");
+        assert!(
+            left.r > 200 && left.b < 60,
+            "the start of the line is red, got {left:?}"
+        );
+        assert!(
+            right.b > 200 && right.r < 60,
+            "the end of the line is blue, got {right:?}"
+        );
     }
 
     #[test]
@@ -1943,8 +2332,14 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
         let at = |x: usize, y: usize| canvas.pixels[y * canvas.width + x];
         let centre = at(50, 50);
         let corner = at(97, 97);
-        assert!(centre.r > 200 && centre.b < 60, "the centre is red, got {centre:?}");
-        assert!(corner.b > 200 && corner.r < 60, "a far corner is blue, got {corner:?}");
+        assert!(
+            centre.r > 200 && centre.b < 60,
+            "the centre is red, got {centre:?}"
+        );
+        assert!(
+            corner.b > 200 && corner.r < 60,
+            "a far corner is blue, got {corner:?}"
+        );
     }
 
     #[test]
@@ -1961,7 +2356,10 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
         let at = |x: usize, y: usize| canvas.pixels[y * canvas.width + x];
         let start = at(2, 10);
         let end = at(97, 10);
-        assert!(start.r > 200 && start.b < 60, "the 0% stop is opaque red, got {start:?}");
+        assert!(
+            start.r > 200 && start.b < 60,
+            "the 0% stop is opaque red, got {start:?}"
+        );
         // A half-alpha blue stop blends with the white background beneath it —
         // neither pure blue (were alpha ignored) nor pure white (were the
         // gradient not reaching 100%).
@@ -1986,7 +2384,10 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
             60.0,
         );
         let centre = canvas.pixels[30 * canvas.width + 30];
-        assert!(centre.r > 200 && centre.b < 60, "expected the gradient's centre stop, got {centre:?}");
+        assert!(
+            centre.r > 200 && centre.b < 60,
+            "expected the gradient's centre stop, got {centre:?}"
+        );
     }
 
     /// Red at this point, or a description of what was there instead.
@@ -2014,8 +2415,14 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
             100.0,
             100.0,
         );
-        assert!(red_at(&canvas, 5, 5), "the overlay belongs at the relative ancestor's top");
-        assert!(!red_at(&canvas, 5, 45), "it must not sit at its static parent's top");
+        assert!(
+            red_at(&canvas, 5, 5),
+            "the overlay belongs at the relative ancestor's top"
+        );
+        assert!(
+            !red_at(&canvas, 5, 45),
+            "it must not sit at its static parent's top"
+        );
     }
 
     #[test]
@@ -2031,8 +2438,14 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
             100.0,
             100.0,
         );
-        assert!(red_at(&canvas, 5, 5), "a fixed box starts at the viewport's own corner");
-        assert!(!red_at(&canvas, 5, 65), "not at the ancestor it happens to sit in");
+        assert!(
+            red_at(&canvas, 5, 5),
+            "a fixed box starts at the viewport's own corner"
+        );
+        assert!(
+            !red_at(&canvas, 5, 65),
+            "not at the ancestor it happens to sit in"
+        );
     }
 
     #[test]
@@ -2050,8 +2463,137 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
             100.0,
             100.0,
         );
-        assert!(red_at(&canvas, 5, 5), "it stays at the top, where it was written");
-        assert!(!red_at(&canvas, 5, 95), "and does not fall to the bottom of its container");
+        assert!(
+            red_at(&canvas, 5, 5),
+            "it stays at the top, where it was written"
+        );
+        assert!(
+            !red_at(&canvas, 5, 95),
+            "and does not fall to the bottom of its container"
+        );
+    }
+
+    #[test]
+    fn a_sheets_urls_are_rebased_onto_the_sheet_rather_than_the_page() {
+        // A font beside `/static.files/site.css` is `/static.files/font.woff2`.
+        // Resolving it against the page asked for `/font.woff2` and got nothing,
+        // which is why a site's own typeface never arrived.
+        let sheet = "https://doc.rust-lang.org/static.files/rustdoc-1ed9.css";
+        let rebased = crate::rebase_urls(
+            "@font-face{src:url(\"FiraSans-0fe4.woff2\") format(\"woff2\")}\
+             .a{background:url(img/bg.png)}\
+             .b{background:url('/rooted.png')}\
+             .c{background:url(https://cdn.example/x.png)}\
+             .d{background:url(data:image/gif;base64,AAA)}",
+            sheet,
+        );
+        assert!(
+            rebased.contains("url(\"https://doc.rust-lang.org/static.files/FiraSans-0fe4.woff2\")")
+        );
+        assert!(rebased.contains("url(https://doc.rust-lang.org/static.files/img/bg.png)"));
+        // Already absolute, rooted at the host, or carrying its own data: left
+        // exactly as written, quotes and all.
+        assert!(rebased.contains("url('/rooted.png')"));
+        assert!(rebased.contains("url(https://cdn.example/x.png)"));
+        assert!(rebased.contains("url(data:image/gif;base64,AAA)"));
+        // Everything that is not a url is untouched.
+        assert!(rebased.contains("format(\"woff2\")"));
+
+        // A base with no directory leaves the sheet alone rather than guessing.
+        assert_eq!(
+            crate::rebase_urls("a{background:url(x.png)}", "sheet.css"),
+            "a{background:url(x.png)}"
+        );
+    }
+
+    #[test]
+    fn a_pseudo_element_rule_is_kept_for_its_own_box_and_not_applied_to_the_element() {
+        // These rules used to be dropped whole, which is why bullets, quote
+        // marks and disclosure arrows were simply absent. They are kept now —
+        // under a name no property can collide with, so that a `::before`'s
+        // `content` and `color` never land on the element they hang off.
+        let sheet = crate::css::parse(
+            "li::before { content: '\\2022  '; color: #ff0000; } li { color: #00ff00; }"
+                .to_string(),
+        );
+        assert_eq!(
+            sheet.rules.len(),
+            2,
+            "the pseudo rule is no longer thrown away"
+        );
+
+        let dom = crate::html::parse("<body><li>x</li></body>".to_string());
+        let styled = crate::style::style_tree(&dom, &sheet);
+        fn find<'a>(
+            node: &'a crate::style::StyledNode<'a>,
+            tag: &str,
+        ) -> Option<&'a crate::style::StyledNode<'a>> {
+            if let crate::dom::NodeType::Element(ref e) = node.node.node_type {
+                if e.tag_name == tag {
+                    return Some(node);
+                }
+            }
+            node.children.iter().find_map(|c| find(c, tag))
+        }
+        let li = find(&styled, "li").expect("the list item");
+        assert!(li.value("::before:content").is_some());
+        assert!(
+            li.value("content").is_none(),
+            "content must not leak onto the element"
+        );
+        // The element keeps its *own* colour, not the pseudo-element's.
+        assert_eq!(
+            li.value("color"),
+            Some(crate::css::Value::ColorValue(crate::Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            }))
+        );
+    }
+
+    #[test]
+    fn a_sticky_box_waits_where_flow_put_it_and_is_then_pinned() {
+        let engine = super::Engine::shapes_only();
+        let css = "body { margin: 0; }
+                   #bar { position: sticky; top: 0; height: 20px; background: #ff0000; }
+                   #rest { height: 400px; }";
+        let mut doc =
+            crate::Document::load("<body><div id=bar></div><div id=rest></div></body>", css);
+
+        // At the top of the page a sticky box is just a box.
+        let page = engine.render_band(
+            &mut doc,
+            50.0,
+            300.0,
+            Some((0.0, 300.0)),
+            &crate::resource::NullLoader,
+        );
+        assert!(
+            page.uses_sticky,
+            "the embedder has to know to re-render on scroll"
+        );
+        assert!(red_at(&page.canvas, 5, 5));
+
+        // Scrolled past, it is pinned to the row the reader can see first, and
+        // has left the place flow gave it.
+        doc.set_scroll(100.0);
+        let page = engine.render_band(
+            &mut doc,
+            50.0,
+            300.0,
+            Some((0.0, 300.0)),
+            &crate::resource::NullLoader,
+        );
+        assert!(
+            red_at(&page.canvas, 5, 105),
+            "pinned at the scroll position"
+        );
+        assert!(
+            !red_at(&page.canvas, 5, 5),
+            "and no longer at the top of the document"
+        );
     }
 
     #[test]
@@ -2071,7 +2613,11 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
         );
         // Neither took a line: the green box is at the very top of the page.
         let top = canvas.pixels[2 * canvas.width + 5];
-        assert_eq!((top.r, top.g, top.b), (0, 255, 0), "hidden markup still took space");
+        assert_eq!(
+            (top.r, top.g, top.b),
+            (0, 255, 0),
+            "hidden markup still took space"
+        );
 
         let doc = crate::Document::load(
             "<body><template>{{ message }}</template>\

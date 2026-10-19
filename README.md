@@ -58,6 +58,7 @@ saved settings.
 | Pose | Effect |
 |------|--------|
 | `menu` | the overflow menu, open |
+| `tabmenu` | a tab's right-click menu, open |
 | `ai` | the assistant panel, open |
 | `hover:star` | a control lit, with its tooltip |
 | `search:wiki` | tab search, filtering |
@@ -77,6 +78,17 @@ saved settings.
 `Ctrl+U` view source · `Ctrl+R` reload · `Ctrl+I` AI panel ·
 `Ctrl+Shift+O` open the page in your other browser ·
 `Ctrl+=`/`Ctrl+-`/`Ctrl+0` zoom (also `Ctrl`+wheel) · `Alt+←/→` back and forward.
+
+Chrome's own shortcuts work the same way here: `Ctrl+1`…`8` / `Ctrl+9` a tab /
+the last tab · `Ctrl+Shift+Tab`, `Ctrl+PgUp/PgDn` previous/next tab ·
+`Ctrl+Shift+PgUp/PgDn` move the tab · `Ctrl+V` paste · `Alt+D`/`F6` address bar ·
+`Ctrl+Enter` complete `www.….com` · `Alt+Enter` open in a new tab · `F5` reload ·
+`F3`/`Ctrl+G` next match (`Shift` for previous) · `F11` full screen ·
+`Alt+Home` new-tab page · `End` bottom of page · `Ctrl+Shift+D` bookmark all tabs ·
+`Ctrl+Shift+Delete` history (with **Clear history**) · `Ctrl+Shift+W` close the window.
+Right-click a tab for its menu (duplicate, pin, close others, close below) or the
+page for back/forward, copy, search the selection and link actions; middle-click
+a tab to close it, and middle-click or `Ctrl`+click a link to open it behind.
 
 **Built-in pages:** `zero://newtab`, `zero://history`, `zero://bookmarks`,
 `zero://downloads`, `zero://settings`.
@@ -125,21 +137,26 @@ forms.
   descendant/child/sibling selectors (`div p`, `>`, `+`, `~`),
   attribute selectors (`[type=text]`, `~=`, `^=`, `$=`, `*=`),
   pseudo-classes (`:hover`, `:nth-child()`, `:first-child`, `:not()`, `:checked`),
+  `::before`/`::after` generated content, inline `style` attributes,
   `visibility`, `opacity`, `z-index`, `transform` (translate/scale),
   `transition` (any property that interpolates),
   `overflow` clipping (including per-glyph text clipping, so a box collapsed to
   a pixel hides its words the way a screen-reader-only heading is meant to),
+  `white-space: nowrap` and `text-overflow: ellipsis`,
   custom properties (`var()`, defined on `:root`), the cascade with specificity, HTML presentation attributes (`bgcolor`, `width`, `align`),
   named colours, `rgb()`/`hsl()`, alpha
 - **Layout**: block, inline (including replaced elements nested in one, so an
   icon inside a link sits on its line), inline-block, flex (wrap/grow/justify/align), grid
   (`repeat()`, `fr`, `minmax()`, spans, named areas), tables (colspan/rowspan),
   floats and `clear`, out-of-flow positioning (`absolute` against the nearest
-  positioned ancestor, `fixed` against the viewport, and the static position for
-  a box that states no offsets), images sized by percentage with their aspect
-  ratio kept, intrinsic sizing, `text-align`, `white-space: pre`
+  positioned ancestor, `fixed` against the viewport, `sticky` pinned as you
+  scroll, and the static position for a box that states no offsets), images
+  sized by percentage with their aspect ratio kept, intrinsic sizing,
+  `text-align`, `white-space: pre`
 - **Text**: shaping via HarfBuzz with a font fallback chain — Latin, Indic
-  (Devanagari, Tamil, Telugu, Bengali and more) and CJK
+  (Devanagari, Tamil, Telugu, Bengali and more) and CJK; `font-family`
+  selection including the `serif`/`monospace` generics, and `@font-face` —
+  `.woff2` included, so a site renders in the typeface it ships
 - **JavaScript**: own lexer, parser and interpreter — closures, classes with
   `super`, `try/catch/finally`, regex literals, `setTimeout`, `JSON`, `fetch`
   with promises and `await`, DOM query and mutation, events
@@ -170,8 +187,12 @@ an unseen script pauses once while its font is read. Layout and paint are
 single-threaded, and a page is painted in full rather than by viewport. A
 selection is whole words: shaping throws characters away, so half a word cannot
 be selected and the copied text has its spacing rebuilt rather than preserved.
-The `style` attribute is ignored — only stylesheets are read — and a `fixed`
-box is anchored to the viewport but does not ride the window as you scroll.
+A `fixed` box is anchored to the viewport but does not ride the window as you
+scroll. The `font` shorthand is not expanded, so a site that sets its face that
+way rather than through `font-family` still falls back. A `::before` gets its
+`content` but not its own colour or size — it inherits the element's. A
+stylesheet's relative `url()`s resolve against the sheet but do not climb with
+`../`. There is no HTTP cache: every visit refetches everything.
 
 ## The documents
 

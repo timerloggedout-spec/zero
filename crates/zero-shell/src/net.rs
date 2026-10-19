@@ -11,6 +11,10 @@ use std::fs;
 use std::io::Read;
 use std::rc::Rc;
 
+/// One request out of a parallel batch: its index in the batch, the url it
+/// ended on, and the body plus response headers when it succeeded.
+type BatchFetch = (usize, String, Option<(Vec<u8>, Vec<String>)>);
+
 /// How Zero identifies itself. Sites use this for rate limiting and for
 /// serving the right markup, and some (Wikimedia among them) reject requests
 /// that arrive with a library's default agent string.
@@ -46,7 +50,9 @@ pub fn has_scheme(s: &str) -> bool {
     match s.split_once("://") {
         Some((scheme, _)) => {
             !scheme.is_empty()
-                && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
         }
         None => false,
     }
@@ -59,8 +65,37 @@ thread_local! {
             .map(|dir| CookieJar::load(&dir))
             .unwrap_or_default(),
     );
+    /// The normal jar, set aside while a private session uses an empty one.
+    static KEPT: RefCell<Option<CookieJar>> = const { RefCell::new(None) };
     /// The site being visited, which partitions every cookie for this page.
     static PARTITION: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Give a private session an empty jar, or end one by putting the normal jar
+/// back. Set aside rather than reloaded from disk, so the session cookies that
+/// keep you signed in — which never reach disk — survive the detour.
+pub fn set_private_jar(on: bool) {
+    JAR.with(|jar| {
+        KEPT.with(|kept| {
+            let mut kept = kept.borrow_mut();
+            match (on, kept.take()) {
+                (true, None) => *kept = Some(jar.replace(CookieJar::default())),
+                (false, Some(normal)) => drop(jar.replace(normal)),
+                (_, already) => *kept = already, // asked for the state it is in
+            }
+        })
+    });
+}
+
+/// Load the jar of the space now in use. Each space owns its cookies, so after
+/// a switch the old space's jar must neither be sent nor saved over the new
+/// one's `cookies.tsv`.
+pub fn reload_jar() {
+    reload_jar_from(crate::storage::trail_dir().as_deref());
+}
+
+fn reload_jar_from(dir: Option<&std::path::Path>) {
+    JAR.set(dir.map(CookieJar::load).unwrap_or_default());
 }
 
 /// Set the top-level site that subsequent requests belong to.
@@ -87,7 +122,14 @@ fn cookie_header(url: &str) -> Option<String> {
 
 /// Record `Set-Cookie` headers from a response, then persist the jar.
 fn absorb_cookies(url: &str, response: &ureq::Response) {
-    store_cookies(url, response.all("set-cookie").iter().map(|h| h.to_string()).collect());
+    store_cookies(
+        url,
+        response
+            .all("set-cookie")
+            .iter()
+            .map(|h| h.to_string())
+            .collect(),
+    );
 }
 
 /// The jar half of [`absorb_cookies`], usable with headers collected elsewhere
@@ -102,7 +144,7 @@ fn store_cookies(url: &str, headers: Vec<String>) {
         for header in headers {
             jar.store(&site, url, &header);
         }
-        if let Some(dir) = crate::storage::profile_dir() {
+        if let Some(dir) = crate::storage::trail_dir() {
             jar.save(&dir);
         }
     });
@@ -121,12 +163,20 @@ pub struct ShellLoader {
     ///
     /// ponytail: lives as long as the tab's document and has no size limit;
     /// a shared LRU across tabs is the upgrade if memory becomes a problem.
+    ///
+    /// Behind it sits [`crate::httpcache`], which survives the document, the
+    /// tab and the process — this map only stops one keystroke refetching a
+    /// page's assets.
     cache: RefCell<HashMap<String, Option<Vec<u8>>>>,
 }
 
 impl ShellLoader {
     pub fn new(base: String) -> ShellLoader {
-        ShellLoader { base, blocked: Rc::new(Cell::new(0)), cache: RefCell::new(HashMap::new()) }
+        ShellLoader {
+            base,
+            blocked: Rc::new(Cell::new(0)),
+            cache: RefCell::new(HashMap::new()),
+        }
     }
 }
 
@@ -165,14 +215,16 @@ impl zero_engine::ResourceLoader for ShellLoader {
                 out[i] = hit.clone();
                 continue;
             }
-            let cookies = is_url(&resolved).then(|| cookie_header(&resolved)).flatten();
+            let cookies = is_url(&resolved)
+                .then(|| cookie_header(&resolved))
+                .flatten();
             pending.push((i, resolved, cookies));
         }
 
         // Batches are built so no host appears more than PER_HOST times: hosts
         // rate-limit per client, and a burst of parallel requests to one of them
         // gets throttled (429) where the same requests spread out succeed.
-        let results: Vec<(usize, String, Option<(Vec<u8>, Vec<String>)>)> = batches(pending)
+        let results: Vec<BatchFetch> = batches(pending)
             .into_iter()
             .flat_map(|batch| {
                 std::thread::scope(|scope| {
@@ -182,7 +234,10 @@ impl zero_engine::ResourceLoader for ShellLoader {
                             scope.spawn(move || (*i, url.clone(), fetch_detached(url, cookies)))
                         })
                         .collect();
-                    handles.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<_>>()
+                    handles
+                        .into_iter()
+                        .filter_map(|h| h.join().ok())
+                        .collect::<Vec<_>>()
                 })
             })
             .collect();
@@ -220,7 +275,11 @@ fn batches(
         let host = host_of(&item.1);
         let slot = out.iter().position(|batch| {
             batch.len() < WORKERS
-                && batch.iter().filter(|(_, url, _)| host_of(url) == host).count() < PER_HOST
+                && batch
+                    .iter()
+                    .filter(|(_, url, _)| host_of(url) == host)
+                    .count()
+                    < PER_HOST
         });
         match slot {
             Some(i) => out[i].push(item),
@@ -231,15 +290,29 @@ fn batches(
 }
 
 fn host_of(url: &str) -> &str {
-    url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("")
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
 }
 
 /// A fetch with no access to shell state, so it can run on a worker thread.
 /// Returns the body and any `Set-Cookie` headers for the caller to store.
+// ureq::Error is 272 bytes and it is ureq's type, not ours -- boxing it here
+// would only move the cost behind an allocation on every request.
+#[allow(clippy::result_large_err)]
 fn fetch_detached(url: &str, cookies: &Option<String>) -> Option<(Vec<u8>, Vec<String>)> {
     if !is_url(url) {
         // Local files and unsupported schemes are cheap; no thread needed.
         return std::fs::read(url).ok().map(|bytes| (bytes, Vec::new()));
+    }
+    // A fresh stored copy needs no request at all. This is the case that makes
+    // revisiting a site you use every day feel like it was already open.
+    let stored = crate::httpcache::get(url);
+    if let Some(entry) = stored.as_ref().filter(|entry| entry.fresh) {
+        return Some((entry.body.clone(), Vec::new()));
     }
     // HTTPS-first, like every other request the shell makes.
     let attempts = match url.strip_prefix("http://") {
@@ -251,6 +324,12 @@ fn fetch_detached(url: &str, cookies: &Option<String>) -> Option<(Vec<u8>, Vec<S
             let mut request = agent().get(&attempt);
             if let Some(header) = cookies {
                 request = request.set("Cookie", header);
+            }
+            // A stale copy is still worth having: these turn the request into a
+            // conditional one, and most static assets answer `304 Not Modified`
+            // with no body at all.
+            for (name, value) in stored.iter().flat_map(|entry| entry.validators()) {
+                request = request.set(name, &value);
             }
             request.call()
         };
@@ -268,53 +347,76 @@ fn fetch_detached(url: &str, cookies: &Option<String>) -> Option<(Vec<u8>, Vec<S
             }
             Err(_) => continue,
         };
-        let set_cookie: Vec<String> =
-            response.all("set-cookie").iter().map(|h| h.to_string()).collect();
-        let mut buf = Vec::new();
-        if response.into_reader().read_to_end(&mut buf).is_ok() {
-            return Some((buf, set_cookie));
+        let set_cookie = header_list(&response, "set-cookie");
+        if let Some(body) = body_of(url, response, stored.as_ref()) {
+            return Some((body, set_cookie));
         }
     }
     None
+}
+
+/// The bytes a response stands for, kept on disk as its headers allow.
+///
+/// ureq 2 returns every status below 400 as `Ok`, so `304 Not Modified` lands
+/// here with no body: what is stored still stands, and the server said so in a
+/// few hundred bytes instead of the whole file. Reading the empty body instead
+/// served every revalidated stylesheet as an empty file, which is why a second
+/// visit to docs.python.org or Wikipedia came up with no styles at all.
+fn body_of(
+    url: &str,
+    response: ureq::Response,
+    stored: Option<&crate::httpcache::Entry>,
+) -> Option<Vec<u8>> {
+    let policy = cache_policy(response.status(), &response);
+    if response.status() == 304 {
+        let entry = stored?;
+        crate::httpcache::refresh(url, entry, &policy);
+        return Some(entry.body.clone());
+    }
+    let mut buf = Vec::new();
+    response.into_reader().read_to_end(&mut buf).ok()?;
+    crate::httpcache::put(url, &buf, &policy);
+    Some(buf)
+}
+
+/// What this response's headers say about storing it.
+fn cache_policy(status: u16, response: &ureq::Response) -> crate::httpcache::Policy {
+    crate::httpcache::policy(status, |name| response.header(name).map(str::to_string))
+}
+
+fn header_list(response: &ureq::Response, name: &str) -> Vec<String> {
+    response.all(name).iter().map(|h| h.to_string()).collect()
 }
 
 /// How long to wait before retrying, honouring `Retry-After` but never stalling
 /// a page load for long — an image is not worth a multi-second freeze, and a
 /// page with many of them would otherwise add up to a hang.
 fn retry_after(response: &ureq::Response) -> std::time::Duration {
-    let secs = response.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok());
+    let secs = response
+        .header("retry-after")
+        .and_then(|v| v.trim().parse::<u64>().ok());
     std::time::Duration::from_millis(secs.map_or(250, |s| (s * 1000).clamp(100, 500)))
 }
 
 impl ShellLoader {
-    /// The uncached fetch, by scheme.
+    /// The fetch behind the in-memory map, by scheme. Goes through the disk
+    /// cache for anything over the network, so a reload costs a validator
+    /// round trip rather than a whole download.
     fn fetch(&self, resolved: &str) -> Option<Vec<u8>> {
         let resolved = resolved.to_string();
         if is_url(&resolved) {
-            // HTTPS-first for subresources too, falling back to cleartext only on failure.
-            let mut buf = Vec::new();
-            if let Some(rest) = resolved.strip_prefix("http://") {
-                if let Some(mut r) = fetch_bytes(&format!("https://{rest}")) {
-                    if r.read_to_end(&mut buf).is_ok() {
-                        return Some(buf);
-                    }
-                    buf.clear();
-                }
-            }
-            fetch_bytes(&resolved)?.read_to_end(&mut buf).ok()?;
-            Some(buf)
+            // One code path for the network, shared with the parallel loader, so
+            // the two cannot drift on what is cacheable.
+            let cookies = cookie_header(&resolved);
+            let (bytes, set_cookie) = fetch_detached(&resolved, &cookies)?;
+            store_cookies(&resolved, set_cookie);
+            Some(bytes)
         } else if resolved.starts_with("data:") {
             None // ponytail: data: URIs unsupported; add base64 decode when needed
         } else {
             fs::read(&resolved).ok()
         }
     }
-}
-
-fn fetch_bytes(url: &str) -> Option<impl Read> {
-    let response = with_cookies(url, agent().get(url)).call().ok()?;
-    absorb_cookies(url, &response);
-    Some(response.into_reader())
 }
 
 /// Resolve a possibly-relative resource URL against a base page URL or file path.
@@ -333,7 +435,13 @@ pub fn resolve_url(base: &str, src: &str) -> String {
     }
     if base.starts_with("http") {
         let scheme = base.split("://").next().unwrap_or("https");
-        let host = base.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
+        let host = base
+            .split("://")
+            .nth(1)
+            .unwrap_or("")
+            .split('/')
+            .next()
+            .unwrap_or("");
         let origin = format!("{scheme}://{host}");
         if let Some(abs) = src.strip_prefix('/') {
             return format!("{origin}/{abs}");
@@ -393,7 +501,7 @@ fn try_fetch(url: &str) -> Result<String, String> {
         Ok(response) => response,
         Err(ureq::Error::Status(code, response)) => {
             absorb_cookies(url, &response);
-            let status = format!("{code} {}", response.status_text().to_string());
+            let status = format!("{code} {}", response.status_text());
             return match response.into_string() {
                 Ok(body) if !body.trim().is_empty() => Ok(body),
                 _ => Err(format!("the server replied {status}")),
@@ -402,7 +510,9 @@ fn try_fetch(url: &str) -> Result<String, String> {
         Err(e) => return Err(describe(&e.to_string())),
     };
     absorb_cookies(url, &response);
-    response.into_string().map_err(|e| format!("the reply could not be read ({e})"))
+    response
+        .into_string()
+        .map_err(|e| format!("the reply could not be read ({e})"))
 }
 
 /// A transport failure in words a person can act on.
@@ -437,21 +547,37 @@ pub fn load_target(target: &str) -> Fetched {
     set_partition(target);
     if !is_url(target) {
         // local: no network
-        return Fetched { url: target.to_string(), body: local_page(target), secure: true };
+        return Fetched {
+            url: target.to_string(),
+            body: local_page(target),
+            secure: true,
+        };
     }
 
     if let Some(rest) = target.strip_prefix("http://") {
         let upgraded = format!("https://{rest}");
         if let Ok(body) = try_fetch(&upgraded) {
-            return Fetched { url: upgraded, body, secure: true };
+            return Fetched {
+                url: upgraded,
+                body,
+                secure: true,
+            };
         }
         eprintln!("HTTPS upgrade failed for {target}; falling back to cleartext");
         let body = try_fetch(target).unwrap_or_else(|why| error_page(target, &why));
-        return Fetched { url: target.to_string(), body, secure: false };
+        return Fetched {
+            url: target.to_string(),
+            body,
+            secure: false,
+        };
     }
 
     let body = try_fetch(target).unwrap_or_else(|why| error_page(target, &why));
-    Fetched { url: target.to_string(), body, secure: true }
+    Fetched {
+        url: target.to_string(),
+        body,
+        secure: true,
+    }
 }
 
 /// The text of a local page file, or a page explaining why it could not be read.
@@ -481,7 +607,11 @@ pub fn local_page(path: &str) -> String {
 /// can do, rather than restating the URL they just typed.
 fn error_page(target: &str, why: &str) -> String {
     use crate::app::theme;
-    let escape = |text: &str| text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let escape = |text: &str| {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
     format!(
         "<html><head><style>\
          body{{background:{canvas};color:{text};font-size:14.5px;\
@@ -520,16 +650,28 @@ mod tests {
             resolve_url("zero://settings", "zero://settings?rail=icons"),
             "zero://settings?rail=icons"
         );
-        assert_eq!(resolve_url("zero://newtab", "https://a.com/x"), "https://a.com/x");
+        assert_eq!(
+            resolve_url("zero://newtab", "https://a.com/x"),
+            "https://a.com/x"
+        );
         assert_eq!(
             resolve_url("examples/page.html", "zero://downloads"),
             "zero://downloads"
         );
         // Relative links still resolve against their base.
-        assert_eq!(resolve_url("https://a.com/docs/x.html", "y.html"), "https://a.com/docs/y.html");
-        assert_eq!(resolve_url("https://a.com/docs/x.html", "/z"), "https://a.com/z");
+        assert_eq!(
+            resolve_url("https://a.com/docs/x.html", "y.html"),
+            "https://a.com/docs/y.html"
+        );
+        assert_eq!(
+            resolve_url("https://a.com/docs/x.html", "/z"),
+            "https://a.com/z"
+        );
         // A scheme-relative link takes the base's scheme.
-        assert_eq!(resolve_url("https://a.com/", "//b.com/x"), "https://b.com/x");
+        assert_eq!(
+            resolve_url("https://a.com/", "//b.com/x"),
+            "https://b.com/x"
+        );
     }
 
     #[test]
@@ -545,8 +687,14 @@ mod tests {
 
     #[test]
     fn failures_are_described_in_plain_words() {
-        assert_eq!(describe("Dns Failed: resolve host"), "that address could not be found");
-        assert_eq!(describe("io: timed out reading"), "the site took too long to reply");
+        assert_eq!(
+            describe("Dns Failed: resolve host"),
+            "that address could not be found"
+        );
+        assert_eq!(
+            describe("io: timed out reading"),
+            "the site took too long to reply"
+        );
         assert_eq!(
             describe("Invalid TLS certificate"),
             "the secure connection could not be established"
@@ -575,7 +723,10 @@ mod tests {
         assert_eq!(batched[1].len(), 1);
         for batch in &batched {
             assert!(batch.len() <= WORKERS);
-            let cdn = batch.iter().filter(|(_, u, _)| host_of(u) == "cdn.com").count();
+            let cdn = batch
+                .iter()
+                .filter(|(_, u, _)| host_of(u) == "cdn.com")
+                .count();
             assert!(cdn <= PER_HOST, "no host may exceed its share of a batch");
         }
     }
@@ -598,9 +749,15 @@ mod tests {
         fs::write(&file, "p{color:red}").expect("write");
 
         let loader = ShellLoader::new(dir.join("page.html").to_string_lossy().into_owned());
-        assert_eq!(loader.load("style.css").as_deref(), Some(&b"p{color:red}"[..]));
+        assert_eq!(
+            loader.load("style.css").as_deref(),
+            Some(&b"p{color:red}"[..])
+        );
         fs::remove_file(&file).expect("remove");
-        assert_eq!(loader.load("style.css").as_deref(), Some(&b"p{color:red}"[..]));
+        assert_eq!(
+            loader.load("style.css").as_deref(),
+            Some(&b"p{color:red}"[..])
+        );
 
         // A miss is remembered too, so a 404 is not retried on every render.
         assert_eq!(loader.load("missing.css"), None);
@@ -609,11 +766,69 @@ mod tests {
     }
 
     #[test]
+    fn not_modified_serves_the_stored_body() {
+        // The bug this guards: ureq hands a 304 back as `Ok`, and its empty
+        // body was served as the stylesheet, so revisits rendered unstyled.
+        let url = "https://a.test/site.css";
+        let stored = crate::httpcache::Entry {
+            body: b"p{color:red}".to_vec(),
+            fresh: false,
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+        };
+        let reply = |status, text, body| ureq::Response::new(status, text, body).expect("response");
+        assert_eq!(
+            body_of(url, reply(304, "Not Modified", ""), Some(&stored)).as_deref(),
+            Some(&b"p{color:red}"[..])
+        );
+        // A 304 with nothing stored vouches for nothing.
+        assert_eq!(body_of(url, reply(304, "Not Modified", ""), None), None);
+        // A 200 is the new body, whatever was stored.
+        assert_eq!(
+            body_of(url, reply(200, "OK", "p{}"), Some(&stored)).as_deref(),
+            Some(&b"p{}"[..])
+        );
+    }
+
+    #[test]
     fn resolves_relative_absolute_and_scheme_relative() {
         let base = "https://example.com/docs/page.html";
-        assert_eq!(resolve_url(base, "img.png"), "https://example.com/docs/img.png");
+        assert_eq!(
+            resolve_url(base, "img.png"),
+            "https://example.com/docs/img.png"
+        );
         assert_eq!(resolve_url(base, "/img.png"), "https://example.com/img.png");
-        assert_eq!(resolve_url(base, "//cdn.net/i.png"), "https://cdn.net/i.png");
-        assert_eq!(resolve_url(base, "https://x.com/i.png"), "https://x.com/i.png");
+        assert_eq!(
+            resolve_url(base, "//cdn.net/i.png"),
+            "https://cdn.net/i.png"
+        );
+        assert_eq!(
+            resolve_url(base, "https://x.com/i.png"),
+            "https://x.com/i.png"
+        );
+    }
+
+    #[test]
+    fn switching_spaces_swaps_the_jar() {
+        // The bug this guards: the jar was loaded once, so after a switch the
+        // old space's cookies were sent, then saved over the new space's.
+        let root = std::env::temp_dir().join("zero-net-jar-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let url = "https://s.test/";
+        for space in ["personal", "work"] {
+            let dir = root.join(space);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let mut jar = CookieJar::default();
+            jar.store(&site_of(url), url, &format!("who={space}; Max-Age=3600"));
+            jar.save(&dir);
+        }
+        set_partition(url);
+
+        reload_jar_from(Some(&root.join("personal")));
+        assert_eq!(cookie_header(url), Some("who=personal".into()));
+        reload_jar_from(Some(&root.join("work")));
+        assert_eq!(cookie_header(url), Some("who=work".into()));
+        reload_jar_from(None); // a space with no profile starts empty
+        assert_eq!(cookie_header(url), None);
     }
 }

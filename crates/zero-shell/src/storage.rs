@@ -26,6 +26,35 @@ pub fn profile_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Whether a private session has the window.
+///
+/// Process-wide rather than a field on the app, because the HTTP cache is read
+/// and written from worker threads that never see the app — and a flag those
+/// threads could miss would be a private session quietly writing to disk.
+static PRIVATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_private(on: bool) {
+    PRIVATE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn is_private() -> bool {
+    PRIVATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Where what browsing leaves behind goes — cookies, `localStorage`, the HTTP
+/// cache, the downloads list. `None` in a private session, so none of it is
+/// written there, and none of the normal session's is read back into it.
+///
+/// History and the session are the app's to decide, since it knows which
+/// pages count; bookmarks, settings and saved files are things you chose to
+/// keep, so they still use [`profile_dir`].
+pub fn trail_dir() -> Option<PathBuf> {
+    match is_private() {
+        true => None,
+        false => profile_dir(),
+    }
+}
+
 /// Where every space lives. The default space keeps this directory itself, so a
 /// profile written before spaces existed needs no migration.
 pub fn root_dir() -> Option<PathBuf> {
@@ -48,7 +77,10 @@ fn sanitize(field: &str) -> String {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Debug, PartialEq)]
@@ -67,7 +99,17 @@ pub fn record_visit(url: &str, title: &str) {
 }
 
 pub fn load_history() -> Vec<Visit> {
-    profile_dir().map(|dir| read_history(&dir)).unwrap_or_default()
+    profile_dir()
+        .map(|dir| read_history(&dir))
+        .unwrap_or_default()
+}
+
+/// Forget every visit in this space. Bookmarks, downloads and the session are
+/// things you chose to keep, so they stay.
+pub fn clear_history() {
+    if let Some(dir) = profile_dir() {
+        let _ = fs::remove_file(dir.join("history.tsv"));
+    }
 }
 
 fn append_visit(dir: &Path, url: &str, title: &str) {
@@ -94,7 +136,11 @@ fn parse_visit(line: &str) -> Option<Visit> {
     if url.is_empty() {
         return None;
     }
-    Some(Visit { when, url, title: parts.next().unwrap_or("").to_string() })
+    Some(Visit {
+        when,
+        url,
+        title: parts.next().unwrap_or("").to_string(),
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -118,7 +164,9 @@ pub fn add_bookmark(url: &str, title: &str) {
 
 /// Remove a bookmark. Returns whether anything was removed.
 pub fn remove_bookmark(url: &str) -> bool {
-    let Some(dir) = profile_dir() else { return false };
+    let Some(dir) = profile_dir() else {
+        return false;
+    };
     let mut marks = read_bookmarks(&dir);
     let before = marks.len();
     marks.retain(|b| b.url != url);
@@ -130,7 +178,9 @@ pub fn remove_bookmark(url: &str) -> bool {
 }
 
 pub fn load_bookmarks() -> Vec<Bookmark> {
-    profile_dir().map(|dir| read_bookmarks(&dir)).unwrap_or_default()
+    profile_dir()
+        .map(|dir| read_bookmarks(&dir))
+        .unwrap_or_default()
 }
 
 thread_local! {
@@ -163,13 +213,19 @@ fn read_bookmarks(dir: &Path) -> Vec<Bookmark> {
     text.lines()
         .filter_map(|line| {
             let (url, title) = line.split_once('\t')?;
-            (!url.is_empty()).then(|| Bookmark { url: url.into(), title: title.into() })
+            (!url.is_empty()).then(|| Bookmark {
+                url: url.into(),
+                title: title.into(),
+            })
         })
         .collect()
 }
 
 fn write_bookmarks(dir: &Path, marks: &[Bookmark]) {
-    let text: String = marks.iter().map(|b| format!("{}\t{}\n", b.url, b.title)).collect();
+    let text: String = marks
+        .iter()
+        .map(|b| format!("{}\t{}\n", b.url, b.title))
+        .collect();
     crate::crypto::write_file(&dir.join("bookmarks.tsv"), &text);
     // Every change to the list goes through here, so this is the one place that
     // has to tell the toolbar's cache it is out of date.
@@ -214,9 +270,12 @@ pub fn save_page(url: &str, title: &str, body: &str) -> Option<String> {
         sanitize(url),
         sanitize(&dir.join(&name).to_string_lossy())
     );
-    let file = profile_dir()?.join("downloads.tsv");
-    let existing = crate::crypto::read_file(&file).unwrap_or_default();
-    crate::crypto::write_file(&file, &(existing + &line));
+    // The file is yours either way; only the record of it is private.
+    if let Some(dir) = trail_dir() {
+        let file = dir.join("downloads.tsv");
+        let existing = crate::crypto::read_file(&file).unwrap_or_default();
+        crate::crypto::write_file(&file, &(existing + &line));
+    }
     Some(name)
 }
 
@@ -225,7 +284,13 @@ pub fn save_page(url: &str, title: &str, body: &str) -> Option<String> {
 /// so a title can never steer the write out of the Downloads folder.
 fn file_stem(title: &str, url: &str) -> String {
     let source = match title.trim() {
-        "" => url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("page"),
+        "" => url
+            .split("://")
+            .nth(1)
+            .unwrap_or(url)
+            .split('/')
+            .next()
+            .unwrap_or("page"),
         title => title,
     };
     let stem: String = source
@@ -255,7 +320,9 @@ fn unique_name(dir: &Path, name: &str) -> String {
 }
 
 pub fn load_downloads() -> Vec<Download> {
-    let Some(dir) = profile_dir() else { return Vec::new() };
+    let Some(dir) = profile_dir() else {
+        return Vec::new();
+    };
     let text = crate::crypto::read_file(&dir.join("downloads.tsv")).unwrap_or_default();
     text.lines().filter_map(parse_download).collect()
 }
@@ -303,10 +370,10 @@ fn read_session(dir: &Path) -> Option<(Vec<(String, bool)>, usize)> {
     let mut lines = text.lines();
     let active: usize = lines.next()?.trim().parse().unwrap_or(0);
     let tabs: Vec<(String, bool)> = lines
-        .filter_map(|line| match line.split_once('\t') {
-            Some((kind, url)) => Some((url.to_string(), kind == "pin")),
+        .map(|line| match line.split_once('\t') {
+            Some((kind, url)) => (url.to_string(), kind == "pin"),
             // A session written before pinning existed is one URL per line.
-            None => Some((line.to_string(), false)),
+            None => (line.to_string(), false),
         })
         .filter(|(url, _)| !url.is_empty())
         .collect();
@@ -332,7 +399,10 @@ mod tests {
             })
         );
         // A title is optional.
-        assert_eq!(parse_visit("5\thttps://a.com").map(|v| v.title), Some(String::new()));
+        assert_eq!(
+            parse_visit("5\thttps://a.com").map(|v| v.title),
+            Some(String::new())
+        );
         // Junk lines are dropped, not fatal.
         assert!(parse_visit("").is_none());
         assert!(parse_visit("not-a-timestamp\thttps://a.com").is_none());
@@ -366,7 +436,10 @@ mod tests {
         let dir = scratch("session");
         assert!(read_session(&dir).is_none()); // nothing saved yet
 
-        let tabs = vec![("https://a.com".to_string(), true), ("https://b.com".to_string(), false)];
+        let tabs = vec![
+            ("https://a.com".to_string(), true),
+            ("https://b.com".to_string(), false),
+        ];
         write_session(&dir, &tabs, 1);
         assert_eq!(read_session(&dir), Some((tabs.clone(), 1)));
 
@@ -378,19 +451,34 @@ mod tests {
     #[test]
     fn a_session_written_before_pinning_still_opens() {
         let dir = scratch("legacy-session");
-        crate::crypto::write_file(&dir.join("session.tsv"), "1\nhttps://a.com\nhttps://b.com\n");
+        crate::crypto::write_file(
+            &dir.join("session.tsv"),
+            "1\nhttps://a.com\nhttps://b.com\n",
+        );
         let (tabs, active) = read_session(&dir).expect("legacy session");
         assert_eq!(active, 1);
-        assert_eq!(tabs, vec![("https://a.com".into(), false), ("https://b.com".into(), false)]);
+        assert_eq!(
+            tabs,
+            vec![
+                ("https://a.com".into(), false),
+                ("https://b.com".into(), false)
+            ]
+        );
     }
 
     #[test]
     fn saved_pages_are_named_after_the_page_and_never_collide() {
         let dir = scratch("downloads");
         // A title becomes the file name; path-hostile characters do not survive.
-        assert_eq!(file_stem("Rust: a language/guide", "https://a.com"), "Rust- a language-guide.html");
+        assert_eq!(
+            file_stem("Rust: a language/guide", "https://a.com"),
+            "Rust- a language-guide.html"
+        );
         // No usable title falls back to the host.
-        assert_eq!(file_stem("  ", "https://news.ycombinator.com/x"), "news.ycombinator.com.html");
+        assert_eq!(
+            file_stem("  ", "https://news.ycombinator.com/x"),
+            "news.ycombinator.com.html"
+        );
         assert_eq!(file_stem("///", "https://a.com"), "page.html");
 
         // Saving twice keeps both copies.

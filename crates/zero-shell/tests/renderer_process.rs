@@ -98,17 +98,27 @@ fn a_very_long_page_sends_a_frame_the_size_of_the_window() {
         "a frame should be about a window tall, got {} rows",
         first.height
     );
-    assert!(first.pixels.len() < 8 * 1024 * 1024, "{} bytes is not one band", first.pixels.len());
+    assert!(
+        first.pixels.len() < 8 * 1024 * 1024,
+        "{} bytes is not one band",
+        first.pixels.len()
+    );
 
     // Scrolled deep into the page, the band follows rather than being clamped
     // to the first screenful.
     write_msg(&mut stdin, "resize", &[], &[400.0, 600.0, 30_000.0]);
     let deep = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame further down");
     assert_eq!(deep.width, 400);
-    assert!(deep.pixels.iter().any(|b| *b != 0), "the deep band should have been painted");
+    assert!(
+        deep.pixels.iter().any(|b| *b != 0),
+        "the deep band should have been painted"
+    );
 
     drop(stdin);
-    assert!(child.wait().expect("wait").success(), "the worker should exit cleanly");
+    assert!(
+        child.wait().expect("wait").success(),
+        "the worker should exit cleanly"
+    );
 }
 
 #[test]
@@ -135,22 +145,33 @@ fn an_icon_inside_a_link_or_a_span_is_still_drawn() {
         ("in a span", format!("<div><span>{ICON}</span></div>")),
         ("in a link", format!("<div><a href='#'>{ICON}</a></div>")),
         ("beside text", format!("<div><span>hi {ICON}</span></div>")),
-        ("nested deeper", format!("<div><a href='#'><span><b>{ICON}</b></span></a></div>")),
+        (
+            "nested deeper",
+            format!("<div><a href='#'><span><b>{ICON}</b></span></a></div>"),
+        ),
     ];
     for (where_it_is, html) in cases {
         write_msg(&mut stdin, "render", &[&html, "", ""], &[60.0, 40.0]);
         let frame = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame");
         let green = frame
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[1] > 200 && p[0] < 80 && p[2] < 80)
             .count();
         // A 20×20 icon, give or take the edges the rasterizer softens.
-        assert!(green > 300, "the icon {where_it_is} drew {green} pixels, not a square");
+        assert!(
+            green > 300,
+            "the icon {where_it_is} drew {green} pixels, not a square"
+        );
     }
 
     drop(stdin);
-    assert!(child.wait().expect("wait").success(), "the worker should exit cleanly");
+    assert!(
+        child.wait().expect("wait").success(),
+        "the worker should exit cleanly"
+    );
 }
 
 #[test]
@@ -177,12 +198,16 @@ fn one_render_worker_answers_two_requests_before_it_exits() {
             "<div id=a></div><style>#a {{ width: 4px; height: 4px; background: {color}; }}</style>"
         );
         write_msg(&mut stdin, "render", &[&html, "", ""], &[10.0, 10.0]);
-        let frame =
-            read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame in reply to each request");
+        let frame = read_frame(&mut stdout, &mut stdin, &mut store)
+            .expect("a frame in reply to each request");
         assert_eq!((frame.width, frame.height), (10, 10));
         // The pixel at (0,0) is the div's own colour — proof this reply
         // reflects *this* request's HTML, not a stale one from before.
-        let want = if color == "#ff0000" { [0xff, 0, 0, 0xff] } else { [0, 0, 0xff, 0xff] };
+        let want = if color == "#ff0000" {
+            [0xff, 0, 0, 0xff]
+        } else {
+            [0, 0, 0xff, 0xff]
+        };
         assert_eq!(&frame.pixels[0..4], &want, "wrong colour for {color}");
     }
 
@@ -191,7 +216,10 @@ fn one_render_worker_answers_two_requests_before_it_exits() {
     // not hang waiting for a request that is never coming.
     drop(stdin);
     let status = child.wait().expect("wait for the worker to exit");
-    assert!(status.success(), "the worker should exit cleanly on EOF, got {status}");
+    assert!(
+        status.success(),
+        "the worker should exit cleanly on EOF, got {status}"
+    );
 }
 
 #[test]
@@ -220,13 +248,20 @@ fn focus_and_typing_mutate_the_same_persistent_document_across_messages() {
     write_msg(&mut stdin, "render", &[html, "", ""], &[200.0, 60.0]);
     let initial = read_frame(&mut stdout, &mut stdin, &mut store).expect("the first frame");
     assert!(!initial.is_focused, "nothing has been focused yet");
-    let (node_id, field) =
-        initial.rect_by_id("box").expect("the input's own rect, for real hit-testing");
+    let (node_id, field) = initial
+        .rect_by_id("box")
+        .expect("the input's own rect, for real hit-testing");
 
     // A patch of the field just past its left padding, where a typed
     // character's ink would land — empty (background colour) before typing.
-    let probe = (field.0 as usize + 8, field.1 as usize + field.3 as usize / 2);
-    assert!(initial.region_is_blank(probe, 8, 8), "an empty field has no ink to find");
+    let probe = (
+        field.0 as usize + 8,
+        field.1 as usize + field.3 as usize / 2,
+    );
+    assert!(
+        initial.region_is_blank(probe, 8, 8),
+        "an empty field has no ink to find"
+    );
 
     // `click` collapses the precedence `app.rs` used to apply itself across
     // two messages (focus wins over a click handler) into one: the renderer
@@ -234,18 +269,27 @@ fn focus_and_typing_mutate_the_same_persistent_document_across_messages() {
     // so clicking a text field should focus it in a single round trip.
     write_msg(&mut stdin, "click", &[], &[node_id as f64]);
     let clicked = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame after click");
-    assert!(clicked.is_focused, "clicking a text field should focus it, not just click it");
+    assert!(
+        clicked.is_focused,
+        "clicking a text field should focus it, not just click it"
+    );
 
     write_msg(&mut stdin, "blur", &[], &[]);
     read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame after blur");
 
     write_msg(&mut stdin, "focus", &[], &[node_id as f64]);
     let focused = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame after focus");
-    assert!(focused.is_focused, "focus should reach the same document the rect came from");
+    assert!(
+        focused.is_focused,
+        "focus should reach the same document the rect came from"
+    );
 
     write_msg(&mut stdin, "insert_text", &["MMMM"], &[]);
     let typed = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame after typing");
-    assert!(!typed.region_is_blank(probe, 8, 8), "typed text should now paint something");
+    assert!(
+        !typed.region_is_blank(probe, 8, 8),
+        "typed text should now paint something"
+    );
 
     // Every message gets its own `frame` reply — four backspaces means four
     // replies queued up, and only the last one has erased everything typed.
@@ -258,7 +302,10 @@ fn focus_and_typing_mutate_the_same_persistent_document_across_messages() {
     // blur it first, which is its own real message to prove works.
     write_msg(&mut stdin, "blur", &[], &[]);
     let erased = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame after blur");
-    assert!(!erased.is_focused, "blur should reach the same document focus did");
+    assert!(
+        !erased.is_focused,
+        "blur should reach the same document focus did"
+    );
     assert!(
         erased.region_is_blank(probe, 8, 8),
         "backspace should have acted on the same field insert_text did, not a fresh one"
@@ -266,7 +313,10 @@ fn focus_and_typing_mutate_the_same_persistent_document_across_messages() {
 
     drop(stdin);
     let status = child.wait().expect("wait for the worker to exit");
-    assert!(status.success(), "the worker should exit cleanly on EOF, got {status}");
+    assert!(
+        status.success(),
+        "the worker should exit cleanly on EOF, got {status}"
+    );
 }
 
 #[test]
@@ -298,7 +348,11 @@ fn localstorage_round_trips_through_the_pipe_to_a_real_kv_store() {
     write_msg(&mut stdin, "render", &[html, "", ""], &[40.0, 40.0]);
     let frame = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame");
 
-    assert_eq!(store.get("k").map(String::as_str), Some("hello"), "the set should have landed");
+    assert_eq!(
+        store.get("k").map(String::as_str),
+        Some("hello"),
+        "the set should have landed"
+    );
     let (_, marker) = frame.rect_by_id("marker").expect("the marker's own rect");
     let (x, y) = (marker.0 as usize + 5, marker.1 as usize + 5);
     let i = (y * frame.width + x) * 4;
@@ -310,7 +364,137 @@ fn localstorage_round_trips_through_the_pipe_to_a_real_kv_store() {
 
     drop(stdin);
     let status = child.wait().expect("wait for the worker to exit");
-    assert!(status.success(), "the worker should exit cleanly on EOF, got {status}");
+    assert!(
+        status.success(),
+        "the worker should exit cleanly on EOF, got {status}"
+    );
+}
+
+#[test]
+fn sessionstorage_is_its_own_store_and_does_not_collide_with_localstorage() {
+    // The two are separate namespaces reached over one pipe, told apart only
+    // by the message name `PipeStore::verb` picks. So the page writes the
+    // *same key* to both with different values and reads both back: if the
+    // scopes were crossed anywhere — the child sending one verb for both, or
+    // the parent routing both to one store — the second write would clobber
+    // the first and one of the two reads would come back wrong.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zero"))
+        .arg("--render-worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the renderer worker");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = child.stdout.take().expect("child stdout");
+    let mut store = std::collections::HashMap::new();
+
+    let html = "<div id=marker></div>\
+                 <style>#marker { width: 20px; height: 20px; background: #ffffff; } \
+                         #marker.ok { background: #00ff00; }</style>\
+                 <script>\
+                   localStorage.setItem('k', 'local');\
+                   sessionStorage.setItem('k', 'session');\
+                   var a = localStorage.getItem('k');\
+                   var b = sessionStorage.getItem('k');\
+                   if (a == 'local' && b == 'session') { \
+                     document.getElementById('marker').className = 'ok'; }\
+                 </script>";
+    write_msg(&mut stdin, "render", &[html, "", ""], &[40.0, 40.0]);
+    let frame = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame");
+
+    assert_eq!(
+        store.get("k").map(String::as_str),
+        Some("local"),
+        "the localStorage write should have landed in the site store"
+    );
+    assert_eq!(
+        store.get("session:k").map(String::as_str),
+        Some("session"),
+        "the sessionStorage write should have landed in the tab store, not the site one"
+    );
+    let (_, marker) = frame.rect_by_id("marker").expect("the marker's own rect");
+    let (x, y) = (marker.0 as usize + 5, marker.1 as usize + 5);
+    let i = (y * frame.width + x) * 4;
+    assert_eq!(
+        &frame.pixels[i..i + 3],
+        &[0, 0xff, 0],
+        "each store should have read back its own value, not the other's"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait for the worker to exit");
+    assert!(
+        status.success(),
+        "the worker should exit cleanly on EOF, got {status}"
+    );
+}
+
+#[test]
+fn a_storage_event_from_another_tab_reaches_this_pages_handler() {
+    // The parent tells a tab about a localStorage write some *other* tab
+    // made, by pushing a `storage_event` into its renderer. This walks that
+    // path against the real worker: a page registers a `storage` listener,
+    // the message arrives, and the handler paints. Nothing else in the
+    // browser can deliver that event, so if the message name, the field
+    // order or the null flags are wrong, the marker stays white.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zero"))
+        .arg("--render-worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the renderer worker");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = child.stdout.take().expect("child stdout");
+    let mut store = std::collections::HashMap::new();
+
+    let html = "<div id=marker></div>\
+                 <style>#marker { width: 20px; height: 20px; background: #ffffff; } \
+                         #marker.ok { background: #00ff00; }</style>\
+                 <script>\
+                   window.addEventListener('storage', function (e) {\
+                     if (e.key == 'shared' && e.oldValue == 'was' && e.newValue == 'now') {\
+                       document.getElementById('marker').className = 'ok';\
+                     }\
+                   });\
+                 </script>";
+    write_msg(&mut stdin, "render", &[html, "", ""], &[40.0, 40.0]);
+    let frame = read_frame(&mut stdout, &mut stdin, &mut store).expect("the first frame");
+
+    // Nothing has happened yet, so the marker is still its resting colour.
+    let (_, marker) = frame.rect_by_id("marker").expect("the marker's own rect");
+    let (x, y) = (marker.0 as usize + 5, marker.1 as usize + 5);
+    let i = (y * frame.width + x) * 4;
+    assert_eq!(
+        &frame.pixels[i..i + 3],
+        &[0xff, 0xff, 0xff],
+        "the handler should not have run before any event was sent"
+    );
+
+    // Now the write another tab made. The three flags say all three fields
+    // are really present rather than empty strings.
+    write_msg(
+        &mut stdin,
+        "storage_event",
+        &["shared", "was", "now", "https://example.com/"],
+        &[1.0, 1.0, 1.0],
+    );
+    let frame = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame after the event");
+
+    let (_, marker) = frame.rect_by_id("marker").expect("the marker's own rect");
+    let (x, y) = (marker.0 as usize + 5, marker.1 as usize + 5);
+    let i = (y * frame.width + x) * 4;
+    assert_eq!(
+        &frame.pixels[i..i + 3],
+        &[0, 0xff, 0],
+        "the storage handler should have run and repainted the marker"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait for the worker to exit");
+    assert!(
+        status.success(),
+        "the worker should exit cleanly on EOF, got {status}"
+    );
 }
 
 struct TestFrame {
@@ -398,13 +582,18 @@ fn read_msg(r: &mut impl Read) -> Option<RawMsg> {
     let mut blob = vec![0u8; blob_len as usize];
     cursor.read_exact(&mut blob).ok()?;
 
-    Some(RawMsg { name, text, nums, blob })
+    Some(RawMsg {
+        name,
+        text,
+        nums,
+        blob,
+    })
 }
 
 /// Decode a `frame` message's body, per the schema `write_frame` in
 /// `renderer.rs` documents: `nums` is `[w, h, uses_hover, animating,
 /// is_focused, rect_count, link_count, match_count]` then `rect_count`
-/// groups of `[node_id, x, y, w, h]`, then link and find-match rects; `text`
+/// groups of `[node_id, x, y, w, h, cursor]`, then link and find-match rects; `text`
 /// is `[title, ...rect ids, ...link hrefs]` in the same order.
 fn decode_frame(msg: RawMsg) -> TestFrame {
     let get = |i: usize| *msg.nums.get(i).unwrap_or(&0.0);
@@ -412,18 +601,29 @@ fn decode_frame(msg: RawMsg) -> TestFrame {
     let is_focused = get(4) != 0.0;
     let rect_count = get(5) as usize;
     // past the fixed header: [w, h, uses_hover, animating, is_focused,
-    // rects, links, matches, doc_height, band_top, text_runs]
-    let mut at = 11;
+    // rects, links, matches, doc_height, band_top, text_runs, uses_sticky]
+    let mut at = 12;
     let mut element_rects = Vec::with_capacity(rect_count);
     for i in 0..rect_count {
-        let (node_id, x, y, w, h) =
-            (get(at) as usize, get(at + 1) as f32, get(at + 2) as f32, get(at + 3) as f32, get(at + 4) as f32);
-        at += 5;
+        let (node_id, x, y, w, h) = (
+            get(at) as usize,
+            get(at + 1) as f32,
+            get(at + 2) as f32,
+            get(at + 3) as f32,
+            get(at + 4) as f32,
+        );
+        at += 6; // the sixth is the pointer shape, which no test here reads
         let id = msg.text.get(1 + i).cloned().unwrap_or_default();
         element_rects.push((node_id, id, x, y, w, h));
     }
 
-    TestFrame { width, height, is_focused, pixels: msg.blob, element_rects }
+    TestFrame {
+        width,
+        height,
+        is_focused,
+        pixels: msg.blob,
+        element_rects,
+    }
 }
 
 /// Read messages until a `frame` arrives, answering `storage_get`/`_set`/
@@ -432,6 +632,12 @@ fn decode_frame(msg: RawMsg) -> TestFrame {
 /// up by hand here since that function is private to the binary crate.
 /// `fetch` answers "missing" for everything: nothing in these tests loads a
 /// subresource.
+///
+/// `session_*` is the same exchange for `sessionStorage`. The real browser
+/// hands those to a separate store; one map with a `session:` prefix stands
+/// in for that here, which keeps the thirteen callers of this helper on one
+/// argument and still fails loudly if the child ever sends a session write
+/// down the `localStorage` path (the key would land unprefixed).
 fn read_frame(
     r: &mut impl Read,
     w: &mut impl Write,
@@ -441,17 +647,38 @@ fn read_frame(
         let msg = read_msg(r)?;
         match msg.name.as_str() {
             "frame" => return Some(decode_frame(msg)),
-            "storage_get" => match store.get(&msg.text[0]) {
-                Some(value) => write_msg(w, "storage_value", &[value], &[1.0]),
-                None => write_msg(w, "storage_value", &[""], &[0.0]),
-            },
-            "storage_set" => {
-                store.insert(msg.text[0].clone(), msg.text[1].clone());
+            "storage_get" | "session_get" => {
+                let key = scoped(&msg.name, &msg.text[0]);
+                match store.get(&key) {
+                    Some(value) => write_msg(w, "storage_value", &[value], &[1.0]),
+                    None => write_msg(w, "storage_value", &[""], &[0.0]),
+                }
             }
-            "storage_remove" => {
-                store.remove(&msg.text[0]);
+            // A write is answered, not fire-and-forget: `setItem` throws when
+            // the area is full, so the child waits to hear that it landed.
+            "storage_set" | "session_set" => {
+                store.insert(scoped(&msg.name, &msg.text[0]), msg.text[1].clone());
+                write_msg(w, "storage_stored", &[], &[1.0]);
             }
-            "storage_clear" => store.clear(),
+            "storage_remove" | "session_remove" => {
+                store.remove(&scoped(&msg.name, &msg.text[0]));
+            }
+            "storage_keys" | "session_keys" => {
+                let prefix = if msg.name.starts_with("session_") {
+                    "session:"
+                } else {
+                    ""
+                };
+                let mut keys: Vec<&str> = store
+                    .keys()
+                    .filter(|k| k.starts_with("session:") == !prefix.is_empty())
+                    .map(|k| k.trim_start_matches("session:"))
+                    .collect();
+                keys.sort_unstable();
+                write_msg(w, "storage_keys_value", &keys, &[]);
+            }
+            "storage_clear" => store.retain(|k, _| k.starts_with("session:")),
+            "session_clear" => store.retain(|k, _| !k.starts_with("session:")),
             "fetch" => {
                 let mut body = Vec::new();
                 for _ in &msg.text {
@@ -470,6 +697,14 @@ fn read_frame(
             }
             _ => return None,
         }
+    }
+}
+
+/// Where a key lands in the stand-in store, given which scope asked.
+fn scoped(message: &str, key: &str) -> String {
+    match message.starts_with("session_") {
+        true => format!("session:{key}"),
+        false => key.to_string(),
     }
 }
 

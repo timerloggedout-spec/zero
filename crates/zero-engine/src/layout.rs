@@ -41,6 +41,92 @@ pub struct TextFragment {
     pub italic: bool,
     /// Which font in the [`FontSet`] shaped this run (fallback picks per word).
     pub font_index: usize,
+    /// Whether this run came from `content` rather than from the document.
+    ///
+    /// Generated content is presentation: it is not in the DOM, so it must not
+    /// be selectable, must not be found by find-in-page, and must not turn up in
+    /// `textContent`. Dragging across a numbered heading has to copy the
+    /// heading, not the number CSS put in front of it.
+    pub generated: bool,
+    /// `text-shadow`, attached when the display list is built rather than
+    /// here: layout has no opinion about shadows, and per spec they contribute
+    /// nothing to any box's size. Shared, because every run in a paragraph
+    /// names the same list.
+    pub shadows: std::rc::Rc<Vec<crate::paint::ShadowSpec>>,
+    /// `text-transform` is presentational: `text` above is what the document
+    /// says, the glyphs are what CSS asked to be drawn, and this is the rule
+    /// that turned one into the other — kept so a re-shape (the `text-overflow`
+    /// ellipsis) transforms the same way the first shaping did.
+    pub transform: TextTransform,
+}
+
+/// `text-transform`, which changes what is *drawn* and nothing else.
+///
+/// Selection, copy and find-in-page must still see the source text: a heading
+/// that reads `HELLO` because of CSS copies as `Hello`. So the transform is
+/// applied on the way into shaping and the original is what
+/// [`TextFragment::text`] keeps.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum TextTransform {
+    #[default]
+    None,
+    Uppercase,
+    Lowercase,
+    Capitalize,
+}
+
+impl TextTransform {
+    fn parse(value: Option<Value>) -> Self {
+        match value {
+            Some(Value::Keyword(word)) => match word.as_str() {
+                "uppercase" => Self::Uppercase,
+                "lowercase" => Self::Lowercase,
+                "capitalize" => Self::Capitalize,
+                // `full-width` and `full-size-kana` are out of scope, and
+                // `none` is the initial value.
+                _ => Self::None,
+            },
+            _ => Self::None,
+        }
+    }
+
+    /// The text as it should be shaped.
+    ///
+    /// The mappings are `str`'s, not `char`'s: the full Unicode ones handle the
+    /// one-to-many cases a per-character mapping gets wrong — German `ß`
+    /// becomes `SS`, and Greek sigma takes its final form at the end of a word.
+    /// Caseless scripts, Indic among them, come back untouched.
+    ///
+    /// ponytail: Turkish dotted and dotless `i` are locale-dependent, and there
+    /// is no locale here to decide against, so they take the default mapping.
+    fn apply<'a>(self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        use std::borrow::Cow;
+        match self {
+            Self::None => Cow::Borrowed(text),
+            Self::Uppercase => Cow::Owned(text.to_uppercase()),
+            Self::Lowercase => Cow::Owned(text.to_lowercase()),
+            Self::Capitalize => Cow::Owned(capitalize(text)),
+        }
+    }
+}
+
+/// Titlecase the first letter of each word.
+///
+/// ponytail: a word boundary here is a transition out of a non-alphabetic
+/// character, which is right for prose in every script that has case. UAX #29
+/// boundaries are the correct answer if that proves insufficient.
+fn capitalize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at_word_start = true;
+    for c in text.chars() {
+        if at_word_start {
+            out.extend(c.to_uppercase());
+        } else {
+            out.push(c);
+        }
+        at_word_start = !c.is_alphabetic();
+    }
+    out
 }
 
 /// One painted word, with the characters it stands for, in absolute page
@@ -61,6 +147,111 @@ pub struct TextRun {
     pub height: f32,
 }
 
+/// What the pointer should look like over an element.
+///
+/// An abstract value, not an OS cursor: the engine stays platform-agnostic and
+/// the embedder maps these onto whatever its windowing library calls them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Cursor {
+    /// Work it out from what is under the pointer — the initial value, and by
+    /// far the most common one.
+    #[default]
+    Auto,
+    Default,
+    Pointer,
+    Text,
+    Wait,
+    Progress,
+    Help,
+    Crosshair,
+    Move,
+    NotAllowed,
+    Grab,
+    Grabbing,
+    ColResize,
+    RowResize,
+    EwResize,
+    NsResize,
+    NeswResize,
+    NwseResize,
+    ZoomIn,
+    ZoomOut,
+    None,
+}
+
+impl Cursor {
+    /// Read a `cursor` value.
+    ///
+    /// `url(...)` entries are skipped in favour of the keyword that must follow
+    /// them: a custom cursor needs image decoding and hotspot handling, and is
+    /// a phishing surface worth thinking about on its own.
+    pub fn parse(spec: &str) -> Cursor {
+        let keyword = spec
+            .rsplit(',')
+            .map(str::trim)
+            .find(|token| !token.starts_with("url(") && !token.is_empty())
+            .unwrap_or("auto");
+        // A keyword after a `url()` may carry the hotspot numbers with it.
+        let keyword = keyword.split_whitespace().next_back().unwrap_or("auto");
+        match keyword.to_ascii_lowercase().as_str() {
+            "default" => Cursor::Default,
+            "pointer" => Cursor::Pointer,
+            "text" => Cursor::Text,
+            "wait" => Cursor::Wait,
+            "progress" => Cursor::Progress,
+            "help" => Cursor::Help,
+            "crosshair" => Cursor::Crosshair,
+            "move" => Cursor::Move,
+            "not-allowed" => Cursor::NotAllowed,
+            "grab" => Cursor::Grab,
+            "grabbing" => Cursor::Grabbing,
+            "col-resize" => Cursor::ColResize,
+            "row-resize" => Cursor::RowResize,
+            "ew-resize" => Cursor::EwResize,
+            "ns-resize" => Cursor::NsResize,
+            "nesw-resize" => Cursor::NeswResize,
+            "nwse-resize" => Cursor::NwseResize,
+            "zoom-in" => Cursor::ZoomIn,
+            "zoom-out" => Cursor::ZoomOut,
+            "none" => Cursor::None,
+            _ => Cursor::Auto,
+        }
+    }
+
+    /// The wire's own numbering, so a cursor survives the trip to the shell
+    /// without a second table to keep in step.
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_code(code: u8) -> Cursor {
+        const ALL: [Cursor; 21] = [
+            Cursor::Auto,
+            Cursor::Default,
+            Cursor::Pointer,
+            Cursor::Text,
+            Cursor::Wait,
+            Cursor::Progress,
+            Cursor::Help,
+            Cursor::Crosshair,
+            Cursor::Move,
+            Cursor::NotAllowed,
+            Cursor::Grab,
+            Cursor::Grabbing,
+            Cursor::ColResize,
+            Cursor::RowResize,
+            Cursor::EwResize,
+            Cursor::NsResize,
+            Cursor::NeswResize,
+            Cursor::NwseResize,
+            Cursor::ZoomIn,
+            Cursor::ZoomOut,
+            Cursor::None,
+        ];
+        ALL.get(code as usize).copied().unwrap_or(Cursor::Default)
+    }
+}
+
 /// The painted area of an element, for hit-testing clicks against scripts.
 #[derive(Clone)]
 pub struct ElementRect {
@@ -71,6 +262,9 @@ pub struct ElementRect {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+    /// Already resolved: `auto` has been turned into what it means here, so the
+    /// embedder has one value to map and no context to reconstruct.
+    pub cursor: Cursor,
 }
 
 /// The painted box of an inline element (`<span>`, `<a>`, `<code>`) on one line.
@@ -82,7 +276,8 @@ pub struct InlineBox {
     pub width: f32,
     pub height: f32,
     pub background: Option<Color>,
-    pub border_color: Option<Color>,
+    pub border_top: Option<Color>,
+    pub border_bottom: Option<Color>,
     pub radius: f32,
 }
 
@@ -161,6 +356,10 @@ pub struct LayoutBox<'a> {
     /// placed it — a positioned child of a flex or grid container, which those
     /// paths skip — and the containing block's own origin stands in.
     static_position: Option<(f32, f32)>,
+    /// The block whose line content this anonymous box holds, when it has one.
+    /// A block lays out no line of its own, so its `::before`/`::after` are
+    /// generated here, where the line is.
+    generated_from: Option<&'a StyledNode<'a>>,
 }
 
 pub enum BoxType<'a> {
@@ -229,6 +428,7 @@ impl<'a> LayoutBox<'a> {
             link_areas: Vec::new(),
             inline_boxes: Vec::new(),
             static_position: None,
+            generated_from: None,
         }
     }
 
@@ -351,10 +551,20 @@ impl<'a> LayoutBox<'a> {
         }
         self.calculate_block_height(containing_block);
         // A replaced element (<img>) overrides content size with its resolved dimensions.
-        if let Some((w, h)) = self.resolved_image_size(images, (containing_block.content.width, containing_block.content.height)) {
+        if let Some((w, h)) = self.resolved_image_size(
+            images,
+            (
+                containing_block.content.width,
+                containing_block.content.height,
+            ),
+        ) {
             self.dimensions.content.width = w;
             self.dimensions.content.height = h;
         }
+        // `text-overflow` belongs to the block, not to the runs inside it, and
+        // it is not inherited — so this is the only place that knows both the
+        // setting and the width the lines had to fit.
+        self.truncate_overflowing_lines(fonts);
         // Positioned descendants resolve against this box's *final* size, so they
         // run last — `bottom`/`right` are meaningless until the height/width are
         // known. Only a box that is actually a containing block does this; a
@@ -365,25 +575,42 @@ impl<'a> LayoutBox<'a> {
         }
     }
 
+    /// Apply this block's `text-overflow: ellipsis` to the lines inside it.
+    ///
+    /// The runs live on this box or on the anonymous block that holds its
+    /// inline content, depending on what else the block contains — both are the
+    /// same one line of text as far as the reader is concerned.
+    fn truncate_overflowing_lines(&mut self, fonts: Option<&FontSet>) {
+        let Some(fonts) = fonts else { return };
+        let ellipsis = match self.box_type {
+            BoxType::AnonymousBlock => false,
+            _ => matches!(
+                self.get_style_node().value("text-overflow"),
+                Some(Value::Keyword(ref k)) if k == "ellipsis"
+            ),
+        };
+        if !ellipsis {
+            return;
+        }
+        let limit = self.dimensions.content.x + self.dimensions.content.width;
+        apply_ellipsis(&mut self.text_fragments, limit, fonts);
+        for child in &mut self.children {
+            if matches!(child.box_type, BoxType::AnonymousBlock) {
+                apply_ellipsis(&mut child.text_fragments, limit, fonts);
+            }
+        }
+    }
+
     /// Lay out every out-of-flow descendant of the given kind that this box is
     /// the containing block for, and place it.
-    fn place_descendants(
-        &mut self,
-        want: OutOfFlow,
-        fonts: Option<&FontSet>,
-        images: &ImageMap,
-    ) {
+    fn place_descendants(&mut self, want: OutOfFlow, fonts: Option<&FontSet>, images: &ImageMap) {
         let container = self.dimensions;
         place_out_of_flow(&mut self.children, container, want, fonts, images);
     }
 
     /// If this box is an `<img>`, resolve its display size from CSS width/height,
     /// else the `width`/`height` attributes, else the image's intrinsic size.
-    fn resolved_image_size(
-        &self,
-        images: &ImageMap,
-        available: (f32, f32),
-    ) -> Option<(f32, f32)> {
+    fn resolved_image_size(&self, images: &ImageMap, available: (f32, f32)) -> Option<(f32, f32)> {
         let styled = match self.box_type {
             BoxType::BlockNode(n) | BoxType::InlineNode(n) => n,
             BoxType::AnonymousBlock => return None,
@@ -503,9 +730,7 @@ impl<'a> LayoutBox<'a> {
                     }
                     // Counted down once at the end of every row, including this
                     // one, so `rowspan: 2` still covers the row below.
-                    for c in column..column + colspan {
-                        carry[c] = rowspan;
-                    }
+                    carry[column..column + colspan].fill(rowspan);
                 }
                 column += colspan;
                 column_count = column_count.max(column);
@@ -551,12 +776,14 @@ impl<'a> LayoutBox<'a> {
             let width = span_width(&widths, item.column, item.colspan, spacing);
             let row_path = rows[item.row];
             let cell = &mut row_at_mut(&mut self.children, row_path).children[item.cell];
-            let mut slot: Dimensions = Default::default();
-            slot.content = Rect {
-                x: container.x,
-                y: container.y,
-                width,
-                height: 0.0,
+            let slot = Dimensions {
+                content: Rect {
+                    x: container.x,
+                    y: container.y,
+                    width,
+                    height: 0.0,
+                },
+                ..Default::default()
             };
             cell.layout(slot, fonts, images);
             if item.rowspan == 1 {
@@ -598,12 +825,14 @@ impl<'a> LayoutBox<'a> {
             let row_path = rows[item.row];
             let top = row_tops[item.row];
             let cell = &mut row_at_mut(&mut self.children, row_path).children[item.cell];
-            let mut slot: Dimensions = Default::default();
-            slot.content = Rect {
-                x,
-                y: top,
-                width,
-                height: 0.0,
+            let slot = Dimensions {
+                content: Rect {
+                    x,
+                    y: top,
+                    width,
+                    height: 0.0,
+                },
+                ..Default::default()
             };
             cell.layout(slot, fonts, images);
             // Stretch so a row's backgrounds share one baseline.
@@ -665,7 +894,7 @@ impl<'a> LayoutBox<'a> {
             Some(Value::Raw(spec)) => spec,
             // Sheets often set the tracks through the `grid-template` shorthand
             // instead; without reading it the whole grid falls back to blocks.
-            _ => match shorthand_tracks(&style, Axis::Columns) {
+            _ => match shorthand_tracks(style, Axis::Columns) {
                 Some(spec) => spec,
                 None => return self.layout_block_children_gapped(fonts, images, gap),
             },
@@ -677,7 +906,7 @@ impl<'a> LayoutBox<'a> {
         // Explicit row sizes, if any; extra rows fall back to content height.
         let row_spec = match style.value("grid-template-rows") {
             Some(Value::Raw(spec)) => Some(spec),
-            _ => shorthand_tracks(&style, Axis::Rows),
+            _ => shorthand_tracks(style, Axis::Rows),
         };
         let row_sizes = match row_spec {
             Some(spec) => resolve_tracks(&spec, container.height, gap, ctx),
@@ -734,10 +963,9 @@ impl<'a> LayoutBox<'a> {
                 let c = explicit_col
                     .unwrap_or(0)
                     .min(columns.len().saturating_sub(colspan));
-                for rr in r..r + rowspan {
-                    for cc in c..(c + colspan).min(columns.len()) {
-                        occupied[rr][cc] = true;
-                    }
+                let c_end = (c + colspan).min(columns.len());
+                for cells in &mut occupied[r..r + rowspan] {
+                    cells[c..c_end].fill(true);
                 }
                 placements.push((index, r, c, colspan, rowspan));
                 continue;
@@ -751,12 +979,11 @@ impl<'a> LayoutBox<'a> {
                 }
                 let start = explicit_col.unwrap_or(col);
                 let fits = start + colspan <= columns.len()
-                    && (row..row + rowspan).all(|r| (start..start + colspan).all(|c| !occupied[r][c]));
+                    && (row..row + rowspan)
+                        .all(|r| (start..start + colspan).all(|c| !occupied[r][c]));
                 if fits {
-                    for r in row..row + rowspan {
-                        for c in start..start + colspan {
-                            occupied[r][c] = true;
-                        }
+                    for cells in &mut occupied[row..row + rowspan] {
+                        cells[start..start + colspan].fill(true);
                     }
                     placements.push((index, row, start, colspan, rowspan));
                     col = if explicit_col.is_some() {
@@ -786,12 +1013,14 @@ impl<'a> LayoutBox<'a> {
         for &(index, r, c, colspan, rowspan) in &placements {
             let width = columns[c..c + colspan].iter().sum::<f32>() + gap * (colspan - 1) as f32;
             let x = container.x + columns[..c].iter().sum::<f32>() + gap * c as f32;
-            let mut slot: Dimensions = Default::default();
-            slot.content = Rect {
-                x,
-                y: container.y,
-                width,
-                height: 0.0,
+            let slot = Dimensions {
+                content: Rect {
+                    x,
+                    y: container.y,
+                    width,
+                    height: 0.0,
+                },
+                ..Default::default()
             };
             self.children[index].layout(slot, fonts, images);
             if rowspan == 1 {
@@ -813,8 +1042,7 @@ impl<'a> LayoutBox<'a> {
         // attribution `layout_table_children` uses for a rowspan cell.
         for &(index, r, _, _, rowspan) in placements.iter().filter(|p| p.4 > 1) {
             let last = (r + rowspan - 1).min(row_heights.len().saturating_sub(1));
-            let covered: f32 =
-                row_heights[r..=last].iter().sum::<f32>() + gap * (last - r) as f32;
+            let covered: f32 = row_heights[r..=last].iter().sum::<f32>() + gap * (last - r) as f32;
             let needed = self.children[index].dimensions.margin_box().height;
             if needed > covered {
                 row_heights[last] += needed - covered;
@@ -826,12 +1054,14 @@ impl<'a> LayoutBox<'a> {
             let y = container.y + row_heights[..r].iter().sum::<f32>() + gap * r as f32;
             let width = columns[c..c + colspan].iter().sum::<f32>() + gap * (colspan - 1) as f32;
             let x = container.x + columns[..c].iter().sum::<f32>() + gap * c as f32;
-            let mut slot: Dimensions = Default::default();
-            slot.content = Rect {
-                x,
-                y,
-                width,
-                height: 0.0,
+            let slot = Dimensions {
+                content: Rect {
+                    x,
+                    y,
+                    width,
+                    height: 0.0,
+                },
+                ..Default::default()
             };
             self.children[index].layout(slot, fonts, images);
             let last = (r + rowspan - 1).min(row_heights.len().saturating_sub(1));
@@ -893,20 +1123,45 @@ impl<'a> LayoutBox<'a> {
         // so its inline children carry what its parent asked for.
         let styled = match self.box_type {
             BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
-            BoxType::AnonymousBlock => self.children.iter().find_map(|child| match child.box_type {
-                BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
-                BoxType::AnonymousBlock => None,
-            }),
+            BoxType::AnonymousBlock => {
+                self.children.iter().find_map(|child| match child.box_type {
+                    BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
+                    BoxType::AnonymousBlock => None,
+                })
+            }
         };
+        let white_space = styled.and_then(|s| s.value("white-space"));
         let preserve_whitespace = matches!(
-            styled.and_then(|s| s.value("white-space")),
+            white_space,
             Some(Value::Keyword(ref k)) if k == "pre" || k == "pre-wrap"
+        );
+        // `nowrap` is half of the truncation idiom every site's card titles and
+        // breadcrumbs use (`overflow: hidden; text-overflow: ellipsis` is the
+        // other half). Wrapping anyway turned a one-line label into a paragraph.
+        let nowrap = matches!(
+            white_space,
+            Some(Value::Keyword(ref k)) if k == "nowrap" || k == "pre"
         );
 
         // Flatten the inline subtree into a stream of text runs and element
         // boundaries, carrying the nearest ancestor link's href with each run.
         let mut pieces: Vec<InlinePiece> = Vec::new();
+        // A block never lays out a line itself — this anonymous box holds its
+        // content — so a block's own `::before`/`::after` belong here, around
+        // everything the block contains.
+        if let Some(owner) = self.generated_from {
+            push_generated(owner, "::before:content", default_size, &None, &mut pieces);
+        }
         for (index, child) in self.children.iter().enumerate() {
+            // An out-of-flow box takes no room on the line — that is what out of
+            // flow *means*. Placing one anyway is how a lazy-loading site's
+            // absolutely positioned placeholder image, which is meant to sit
+            // behind the real one, got a line of its own and pushed the picture
+            // down onto the text below it. `place_descendants` positions it
+            // afterwards, from its containing block, as it does for a block.
+            if child.is_out_of_flow() {
+                continue;
+            }
             // Inside an inline container, a block-level box can only be an
             // inline-block, so it joins the line as one indivisible item.
             if matches!(child.box_type, BoxType::BlockNode(_)) {
@@ -914,6 +1169,9 @@ impl<'a> LayoutBox<'a> {
             } else {
                 collect_inline_text(child, default_size, None, &mut pieces, &[index]);
             }
+        }
+        if let Some(owner) = self.generated_from {
+            push_generated(owner, "::after:content", default_size, &None, &mut pieces);
         }
 
         let mut inline_boxes: Vec<InlineBox> = Vec::new();
@@ -986,12 +1244,14 @@ impl<'a> LayoutBox<'a> {
                         line_height = 0.0;
                     }
                     cursor_x += lead;
-                    let mut slot: Dimensions = Default::default();
-                    slot.content = Rect {
-                        x: cursor_x,
-                        y: cursor_y,
-                        width: outer,
-                        height: 0.0,
+                    let slot = Dimensions {
+                        content: Rect {
+                            x: cursor_x,
+                            y: cursor_y,
+                            width: outer,
+                            height: 0.0,
+                        },
+                        ..Default::default()
                     };
                     let placed = {
                         let box_at = descend(self, path);
@@ -1060,9 +1320,10 @@ impl<'a> LayoutBox<'a> {
                     if line.is_empty() {
                         continue; // a blank line still occupies its height
                     }
-                    let font_index = fonts.pick(line);
+                    let shaped = piece.transform.apply(line);
+                    let font_index = fonts.pick_in(&piece.families, &shaped);
                     let (mut glyphs, width) =
-                        shape_run(&fonts.entries[font_index], line, piece.size);
+                        shape_run(&fonts.entries[font_index], &shaped, piece.size);
                     let width = width + spread_glyphs(&mut glyphs, piece.letter_spacing);
                     fragments.push(TextFragment {
                         glyphs,
@@ -1078,6 +1339,9 @@ impl<'a> LayoutBox<'a> {
                         bold: piece.bold,
                         italic: piece.italic,
                         font_index,
+                        transform: piece.transform,
+                        shadows: std::rc::Rc::new(Vec::new()),
+                        generated: piece.generated,
                     });
                     if let Some(href) = &piece.href {
                         link_areas.push(LinkArea {
@@ -1100,9 +1364,10 @@ impl<'a> LayoutBox<'a> {
             for word in piece.text.split_ascii_whitespace() {
                 // Pick a font that can draw this word, then shape it: this is where
                 // Indic reordering/conjuncts happen.
-                let font_index = fonts.pick(word);
+                let shaped = piece.transform.apply(word);
+                let font_index = fonts.pick_in(&piece.families, &shaped);
                 let (mut glyphs, word_w) =
-                    shape_run(&fonts.entries[font_index], word, piece.size);
+                    shape_run(&fonts.entries[font_index], &shaped, piece.size);
                 let word_w = word_w + spread_glyphs(&mut glyphs, piece.letter_spacing);
                 let mut lead = if pending_space && cursor_x > start_x {
                     space_w
@@ -1110,7 +1375,7 @@ impl<'a> LayoutBox<'a> {
                     0.0
                 };
                 // Wrap if this word overflows and we're not at line start.
-                if cursor_x > start_x && cursor_x + lead + word_w > start_x + max_width {
+                if !nowrap && cursor_x > start_x && cursor_x + lead + word_w > start_x + max_width {
                     lead = 0.0;
                     // Close each open element on the line it is leaving, then
                     // reopen it on the next one, so a wrapped span paints twice.
@@ -1144,6 +1409,9 @@ impl<'a> LayoutBox<'a> {
                     bold: piece.bold,
                     italic: piece.italic,
                     font_index,
+                    transform: piece.transform,
+                    shadows: std::rc::Rc::new(Vec::new()),
+                    generated: piece.generated,
                 });
                 if let Some(href) = &piece.href {
                     link_areas.push(LinkArea {
@@ -1186,10 +1454,12 @@ impl<'a> LayoutBox<'a> {
         // so its inline children carry the value its parent set.
         let styled = match self.box_type {
             BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
-            BoxType::AnonymousBlock => self.children.iter().find_map(|child| match child.box_type {
-                BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
-                BoxType::AnonymousBlock => None,
-            }),
+            BoxType::AnonymousBlock => {
+                self.children.iter().find_map(|child| match child.box_type {
+                    BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
+                    BoxType::AnonymousBlock => None,
+                })
+            }
         };
         let align = match styled.and_then(|s| s.value("text-align")) {
             Some(Value::Keyword(word)) => word,
@@ -1252,8 +1522,8 @@ impl<'a> LayoutBox<'a> {
             .unwrap_or_else(|| auto.clone());
         let mut margin_left = style.lookup("margin-left", "margin", &zero);
         let mut margin_right = style.lookup("margin-right", "margin", &zero);
-        let border_left = style.lookup("border-left-width", "border-width", &zero);
-        let border_right = style.lookup("border-right-width", "border-width", &zero);
+        let border_left = style.border_width("left");
+        let border_right = style.border_width("right");
         let padding_left = style.lookup("padding-left", "padding", &zero);
         let padding_right = style.lookup("padding-right", "padding", &zero);
         // `margin: 0 auto` is the case worth getting right: both sides start
@@ -1265,15 +1535,20 @@ impl<'a> LayoutBox<'a> {
             style.value("box-sizing"),
             Some(Value::Keyword(ref k)) if k == "border-box"
         );
-        let edges: f32 =
-            [&border_left, &border_right, &padding_left, &padding_right]
-                .iter()
-                .map(|v| v.resolve(ctx))
-                .sum();
+        let edges: f32 = [&border_left, &border_right, &padding_left, &padding_right]
+            .iter()
+            .map(|v| v.resolve(ctx))
+            .sum();
         // `width`/`min-width`/`max-width` name the border box under border-box
         // sizing; subtract the edges once here so the rest of this function —
         // written for content-box — never has to know the difference.
-        let to_content = |px: f32| if border_box { (px - edges).max(0.0) } else { px };
+        let to_content = |px: f32| {
+            if border_box {
+                (px - edges).max(0.0)
+            } else {
+                px
+            }
+        };
         // `calc()` normalizes to a resolved px length here too, same as a
         // plain `Length` — everything downstream only ever needs to compare
         // against `auto` or read an already-resolved px value.
@@ -1380,12 +1655,8 @@ impl<'a> LayoutBox<'a> {
         let d = &mut self.dimensions;
         d.margin.top = style.lookup("margin-top", "margin", &zero).resolve(ctx);
         d.margin.bottom = style.lookup("margin-bottom", "margin", &zero).resolve(ctx);
-        d.border.top = style
-            .lookup("border-top-width", "border-width", &zero)
-            .resolve(ctx);
-        d.border.bottom = style
-            .lookup("border-bottom-width", "border-width", &zero)
-            .resolve(ctx);
+        d.border.top = style.border_width("top").resolve(ctx);
+        d.border.bottom = style.border_width("bottom").resolve(ctx);
         d.padding.top = style.lookup("padding-top", "padding", &zero).resolve(ctx);
         d.padding.bottom = style
             .lookup("padding-bottom", "padding", &zero)
@@ -1579,8 +1850,10 @@ impl<'a> LayoutBox<'a> {
                         .and_then(|v| v.as_number())
                         .unwrap_or(0.0);
                     // Items shrink by default (`flex-shrink: 1`) unless told not to.
-                    let shrink =
-                        style.value("flex-shrink").and_then(|v| v.as_number()).unwrap_or(1.0);
+                    let shrink = style
+                        .value("flex-shrink")
+                        .and_then(|v| v.as_number())
+                        .unwrap_or(1.0);
                     Item { base, grow, shrink }
                 }
             })
@@ -1603,6 +1876,7 @@ impl<'a> LayoutBox<'a> {
         let stated_height = style
             .value("height")
             .filter(|v| matches!(v, Value::Length(..) | Value::Calc(..)))
+            .filter(|v| !is_indefinite_percentage(v, container.height))
             .map(|v| v.resolve(style.length_context(container.height)));
 
         // Group items into lines. Without wrapping everything shares one line.
@@ -1661,12 +1935,14 @@ impl<'a> LayoutBox<'a> {
             let mut cursor_x = container.x + offset;
             let mut tallest = 0.0_f32;
             for (slot_index, &i) in line.iter().enumerate() {
-                let mut slot: Dimensions = Default::default();
-                slot.content = Rect {
-                    x: cursor_x,
-                    y: cursor_y,
-                    width: widths[slot_index],
-                    height: 0.0,
+                let slot = Dimensions {
+                    content: Rect {
+                        x: cursor_x,
+                        y: cursor_y,
+                        width: widths[slot_index],
+                        height: 0.0,
+                    },
+                    ..Default::default()
                 };
                 self.children[i].layout(slot, fonts, images);
                 // The line's own grow/shrink math wins over whatever the item's
@@ -1696,8 +1972,12 @@ impl<'a> LayoutBox<'a> {
                     }
                 };
                 let d = &mut self.children[i].dimensions;
-                let edges =
-                    margin_left + margin_right + d.border.left + d.border.right + d.padding.left + d.padding.right;
+                let edges = margin_left
+                    + margin_right
+                    + d.border.left
+                    + d.border.right
+                    + d.padding.left
+                    + d.padding.right;
                 d.margin.left = margin_left;
                 d.margin.right = margin_right;
                 d.content.width = (widths[slot_index] - edges).max(0.0);
@@ -1752,25 +2032,39 @@ impl<'a> LayoutBox<'a> {
         );
         let zero = Value::Length(0.0, Unit::Px);
         let edges: f32 = [
-            style.lookup("border-top-width", "border-width", &zero),
-            style.lookup("border-bottom-width", "border-width", &zero),
+            style.border_width("top"),
+            style.border_width("bottom"),
             style.lookup("padding-top", "padding", &zero),
             style.lookup("padding-bottom", "padding", &zero),
         ]
         .iter()
         .map(|v| v.resolve(ctx))
         .sum();
-        let to_content = |px: f32| if border_box { (px - edges).max(0.0) } else { px };
+        let to_content = |px: f32| {
+            if border_box {
+                (px - edges).max(0.0)
+            } else {
+                px
+            }
+        };
 
         if let Some(value) = style.value("height") {
-            if matches!(value, Value::Length(..) | Value::Calc(..)) {
+            if matches!(value, Value::Length(..) | Value::Calc(..))
+                && !is_indefinite_percentage(&value, containing_block.content.height)
+            {
                 self.dimensions.content.height = to_content(value.resolve(ctx));
             }
         }
-        if let Some(min) = style.value("min-height").map(|v| to_content(v.resolve(ctx))) {
+        if let Some(min) = style
+            .value("min-height")
+            .map(|v| to_content(v.resolve(ctx)))
+        {
             self.dimensions.content.height = self.dimensions.content.height.max(min);
         }
-        if let Some(max) = style.value("max-height").map(|v| to_content(v.resolve(ctx))) {
+        if let Some(max) = style
+            .value("max-height")
+            .map(|v| to_content(v.resolve(ctx)))
+        {
             self.dimensions.content.height = self.dimensions.content.height.min(max);
         }
     }
@@ -1778,14 +2072,16 @@ impl<'a> LayoutBox<'a> {
     fn get_inline_container(&mut self) -> &mut LayoutBox<'a> {
         match self.box_type {
             BoxType::InlineNode(_) | BoxType::AnonymousBlock => self,
-            BoxType::BlockNode(_) => {
+            BoxType::BlockNode(styled) => {
                 // Inline children of a block box go in an anonymous block wrapper.
                 let needs_new = !matches!(
                     self.children.last().map(|c| &c.box_type),
                     Some(BoxType::AnonymousBlock)
                 );
                 if needs_new {
-                    self.children.push(LayoutBox::new(BoxType::AnonymousBlock));
+                    let mut anon = LayoutBox::new(BoxType::AnonymousBlock);
+                    anon.generated_from = Some(styled);
+                    self.children.push(anon);
                 }
                 self.children.last_mut().unwrap()
             }
@@ -1793,11 +2089,26 @@ impl<'a> LayoutBox<'a> {
     }
 }
 
+/// Lay a styled tree out inside `containing_block`.
+///
+/// `scroll_top` is the first document row the reader can see. Layout is
+/// otherwise scroll-independent; this exists for `position: sticky`, which is
+/// the one thing whose *position* depends on how far down the page you are.
 pub fn layout_tree<'a>(
+    node: &'a StyledNode<'a>,
+    containing_block: Dimensions,
+    fonts: Option<&FontSet>,
+    images: &ImageMap,
+) -> LayoutBox<'a> {
+    layout_tree_scrolled(node, containing_block, fonts, images, 0.0)
+}
+
+pub fn layout_tree_scrolled<'a>(
     node: &'a StyledNode<'a>,
     mut containing_block: Dimensions,
     fonts: Option<&FontSet>,
     images: &ImageMap,
+    scroll_top: f32,
 ) -> LayoutBox<'a> {
     // Height starts at 0 so children accumulate into it.
     let viewport = containing_block;
@@ -1808,7 +2119,18 @@ pub fn layout_tree<'a>(
     // positioned ancestor anywhere above it anchors to the page, and every
     // `fixed` box anchors to the viewport no matter what it sits inside.
     root_box.place_descendants(OutOfFlow::Absolute, fonts, images);
-    place_out_of_flow(&mut root_box.children, viewport, OutOfFlow::Fixed, fonts, images);
+    place_out_of_flow(
+        &mut root_box.children,
+        viewport,
+        OutOfFlow::Fixed,
+        fonts,
+        images,
+    );
+    // Last, because a sticky box is pinned relative to where flow left it, and
+    // an out-of-flow one inside it has to have been placed first.
+    if scroll_top > 0.0 {
+        apply_sticky(&mut root_box, scroll_top);
+    }
     root_box
 }
 
@@ -1878,6 +2200,9 @@ fn place_out_of_flow(
 struct TextPiece {
     text: String,
     size: f32,
+    /// What the page asked for, best first. Shared rather than copied: every
+    /// run in a paragraph names the same list.
+    families: std::rc::Rc<Vec<String>>,
     line_height: f32,
     letter_spacing: f32,
     color: Color,
@@ -1886,6 +2211,8 @@ struct TextPiece {
     bold: bool,
     italic: bool,
     href: Option<String>,
+    transform: TextTransform,
+    generated: bool,
 }
 
 /// Push `spacing` px of extra room after each glyph — shaping only knows a
@@ -1904,7 +2231,8 @@ fn spread_glyphs(glyphs: &mut [PositionedGlyph], spacing: f32) -> f32 {
 #[derive(Clone)]
 struct InlineStyle {
     background: Option<Color>,
-    border_color: Option<Color>,
+    border_top: Option<Color>,
+    border_bottom: Option<Color>,
     radius: f32,
     pad_left: f32,
     pad_right: f32,
@@ -1942,7 +2270,8 @@ impl OpenInline {
             width: (end_x - self.start_x).max(0.0),
             height: self.height + self.style.pad_top + self.style.pad_bottom,
             background: self.style.background,
-            border_color: self.style.border_color,
+            border_top: self.style.border_top,
+            border_bottom: self.style.border_bottom,
             radius: self.style.radius,
         }
     }
@@ -1975,6 +2304,7 @@ fn collect_inline_text(
                 out.push(InlinePiece::Enter(style));
                 decorated = true;
             }
+            push_generated(styled, "::before:content", default_size, &current_href, out);
         }
         if let NodeType::Text(ref t) = styled.node.node_type {
             let size = if styled.font_size() > 0.0 {
@@ -2007,6 +2337,14 @@ fn collect_inline_text(
             out.push(InlinePiece::Text(TextPiece {
                 text: t.clone(),
                 size,
+                families: std::rc::Rc::new(match styled.value("font-family") {
+                    Some(value) => crate::css::family_list(&match value {
+                        Value::Raw(text) => text,
+                        Value::Keyword(word) => word,
+                        _ => String::new(),
+                    }),
+                    None => Vec::new(),
+                }),
                 line_height: styled.line_height(),
                 letter_spacing: styled.px("letter-spacing", 0.0).unwrap_or(0.0),
                 color,
@@ -2015,10 +2353,16 @@ fn collect_inline_text(
                 bold,
                 italic,
                 href: current_href.clone(),
+                transform: TextTransform::parse(styled.value("text-transform")),
+                generated: false,
             }));
         }
     }
     for (index, child) in bx.children.iter().enumerate() {
+        // Out of flow: no room on the line, here as in the block path above.
+        if child.is_out_of_flow() {
+            continue;
+        }
         let mut child_path = path.to_vec();
         child_path.push(index);
         // A block-level box this far in is an inline-block or a replaced element
@@ -2028,12 +2372,228 @@ fn collect_inline_text(
         if matches!(child.box_type, BoxType::BlockNode(_)) {
             out.push(InlinePiece::Atomic(child_path));
         } else {
-            collect_inline_text(child, default_size, current_href.as_deref(), out, &child_path);
+            collect_inline_text(
+                child,
+                default_size,
+                current_href.as_deref(),
+                out,
+                &child_path,
+            );
         }
+    }
+    if let BoxType::InlineNode(styled) | BoxType::BlockNode(styled) = bx.box_type {
+        push_generated(styled, "::after:content", default_size, &current_href, out);
     }
     if decorated {
         out.push(InlinePiece::Exit);
     }
+}
+
+/// Emit a `::before`/`::after` box's text, if the page asked for one.
+///
+/// ponytail: the generated box takes the *element's* own styling rather than
+/// the pseudo-rule's, so its `content` arrives but a `::before` with a colour,
+/// size or background of its own does not get them. Giving it those means a
+/// styled node with no DOM node behind it, which the styled tree has no room
+/// for yet. The common cases — a bullet, a quote mark, a disclosure arrow, a
+/// separator — inherit anyway and come out right.
+///
+/// ponytail: `content: url(...)` is not drawn. A generated *image* needs the
+/// pseudo-element to be a replaced box of its own, which is the same missing
+/// piece as styling it; every textual component is handled.
+fn push_generated(
+    styled: &StyledNode,
+    key: &str,
+    default_size: f32,
+    href: &Option<String>,
+    out: &mut Vec<InlinePiece>,
+) {
+    let Some(Value::Raw(raw)) = styled.value(key) else {
+        return;
+    };
+    let text = content_text(&raw, styled);
+    if text.is_empty() {
+        return; // `content: ""` marks a box to style, and there is no box yet
+    }
+    let size = match styled.font_size() > 0.0 {
+        true => styled.font_size(),
+        false => default_size,
+    };
+    out.push(InlinePiece::Text(TextPiece {
+        text,
+        size,
+        families: std::rc::Rc::new(match styled.value("font-family") {
+            Some(Value::Raw(list)) => crate::css::family_list(&list),
+            _ => Vec::new(),
+        }),
+        line_height: styled.line_height(),
+        letter_spacing: styled.px("letter-spacing", 0.0).unwrap_or(0.0),
+        color: match styled.value("color") {
+            Some(Value::ColorValue(c)) => c,
+            _ => Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+        },
+        underline: false,
+        strikethrough: false,
+        bold: false,
+        italic: false,
+        transform: TextTransform::parse(styled.value("text-transform")),
+        href: href.clone(),
+        generated: true,
+    }));
+}
+
+/// The text a `content` value produces: its components, in order, concatenated.
+///
+/// `content` is a *list* — `"Figure " counter(fig) ": "` is three components,
+/// and every one of them contributes. `counter()` and `counters()` have already
+/// been turned into quoted strings by the style walk, which is the only pass
+/// that knows document order; what is left here is strings, `attr()`, the quote
+/// keywords, and the values that mean "nothing".
+fn content_text(raw: &str, styled: &StyledNode) -> String {
+    let mut out = String::new();
+    for component in split_content(raw) {
+        let component = component.trim();
+        if component.is_empty() {
+            continue;
+        }
+        match component {
+            // `normal` on a pseudo-element is `none`; both generate nothing.
+            "normal" | "none" => return String::new(),
+            "open-quote" | "close-quote" => out.push_str(&quote_mark(styled, component)),
+            // The "no quote, but still count as one" pair. Nothing to add.
+            "no-open-quote" | "no-close-quote" => {}
+            _ => {
+                if let Some(name) = component
+                    .strip_prefix("attr(")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                {
+                    // Printing a link's target is the classic use, and print
+                    // stylesheets are full of it.
+                    if let NodeType::Element(e) = &styled.node.node_type {
+                        if let Some(value) = e.attributes.get(name.trim()) {
+                            out.push_str(value);
+                        }
+                    }
+                } else if component.starts_with("url(") {
+                    // A generated image; see the note on `push_generated`.
+                } else {
+                    out.push_str(&unquote_content(component));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `content`'s components: whitespace-separated, but a quoted string may hold
+/// spaces and a function may hold commas.
+fn split_content(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut depth = 0usize;
+    let mut escaped = false;
+    for c in raw.chars() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                current.push(c);
+                match c {
+                    '\\' => escaped = true,
+                    c if c == q => quote = None,
+                    _ => {}
+                }
+            }
+            None => match c {
+                '"' | '\'' => {
+                    quote = Some(c);
+                    current.push(c);
+                }
+                '(' => {
+                    depth += 1;
+                    current.push(c);
+                }
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    current.push(c);
+                }
+                c if c.is_whitespace() && depth == 0 => {
+                    if !current.is_empty() {
+                        out.push(std::mem::take(&mut current));
+                    }
+                }
+                c => current.push(c),
+            },
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// The mark `open-quote`/`close-quote` stands for, from the `quotes` property.
+///
+/// Worth honouring rather than hard-coding: quotation conventions differ by
+/// language, and Zero ships in more than one.
+///
+/// ponytail: one level of nesting. `quotes` may list several pairs for quotes
+/// inside quotes; tracking the depth needs a counter of its own on the walk.
+fn quote_mark(styled: &StyledNode, which: &str) -> String {
+    let marks: Vec<String> = match styled.value("quotes") {
+        Some(Value::Raw(raw)) => split_content(&raw)
+            .iter()
+            .map(|token| unquote_content(token))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let index = usize::from(which == "close-quote");
+    match marks.get(index) {
+        Some(mark) => mark.clone(),
+        // The typographic default, which is what a page that says nothing means.
+        None => match which == "close-quote" {
+            true => "\u{201d}".to_string(),
+            false => "\u{201c}".to_string(),
+        },
+    }
+}
+
+/// One `content` string component, with its quotes stripped and its escapes
+/// resolved.
+fn unquote_content(raw: &str) -> String {
+    let raw = raw.trim();
+    let inner = ['"', '\'']
+        .iter()
+        .find_map(|q| raw.strip_prefix(*q).and_then(|r| r.strip_suffix(*q)))
+        .unwrap_or("");
+    // `content: "\201C"` is how a sheet writes a character it cannot type.
+    let mut out = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let mut hex = String::new();
+        while hex.len() < 6 && chars.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+            hex.push(chars.next().expect("peeked"));
+        }
+        match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+            Some(escaped) => out.push(escaped),
+            // Not an escape sequence: a literal backslash before something else.
+            None => out.push_str(&hex),
+        }
+    }
+    out
 }
 
 /// The box a [`InlinePiece::Atomic`] path names, walking down from `root`.
@@ -2063,12 +2623,13 @@ fn inline_style_of(styled: &StyledNode) -> Option<InlineStyle> {
         _ => None,
     };
     let background = color_of("background").or_else(|| color_of("background-color"));
-    let border_color = color_of("border-color");
+    let (border_top, border_bottom) = (styled.border_color("top"), styled.border_color("bottom"));
     let (pad_left, pad_right) = (pad("padding-left"), pad("padding-right"));
     let (pad_top, pad_bottom) = (pad("padding-top"), pad("padding-bottom"));
 
     if background.is_none()
-        && border_color.is_none()
+        && border_top.is_none()
+        && border_bottom.is_none()
         && pad_left == 0.0
         && pad_right == 0.0
         && pad_top == 0.0
@@ -2078,7 +2639,8 @@ fn inline_style_of(styled: &StyledNode) -> Option<InlineStyle> {
     }
     Some(InlineStyle {
         background,
-        border_color,
+        border_top,
+        border_bottom,
         radius: styled.px("border-radius", 0.0).unwrap_or(0.0),
         pad_left,
         pad_right,
@@ -2091,15 +2653,15 @@ fn inline_style_of(styled: &StyledNode) -> Option<InlineStyle> {
 fn horizontal_edges(style: &StyledNode, ctx: LengthContext) -> f32 {
     let zero = Value::Length(0.0, Unit::Px);
     [
-        ("margin-left", "margin"),
-        ("margin-right", "margin"),
-        ("border-left-width", "border-width"),
-        ("border-right-width", "border-width"),
-        ("padding-left", "padding"),
-        ("padding-right", "padding"),
+        style.lookup("margin-left", "margin", &zero),
+        style.lookup("margin-right", "margin", &zero),
+        style.border_width("left"),
+        style.border_width("right"),
+        style.lookup("padding-left", "padding", &zero),
+        style.lookup("padding-right", "padding", &zero),
     ]
     .iter()
-    .map(|(name, short)| style.lookup(name, short, &zero).resolve(ctx))
+    .map(|v| v.resolve(ctx))
     .sum()
 }
 
@@ -2143,18 +2705,20 @@ fn align_cross_axis(
     match mode {
         "center" | "flex-end" | "end" if slack > 0.0 => {
             let shift = if mode == "center" { slack / 2.0 } else { slack };
-            let mut slot: Dimensions = Default::default();
-            slot.content = Rect {
-                x: outer.x,
-                y: line_top + shift,
-                // Laying the box out again has to hand it a containing block it
-                // will arrive back at the same width from, and `width: auto`
-                // takes the box's own edges off whatever it is given — so that
-                // is the outer width, not the content width. Passing the content
-                // width charged every padded item for its padding twice, which
-                // is how a centred icon ended up narrower than its own picture.
-                width: outer.width,
-                height: 0.0,
+            let slot = Dimensions {
+                content: Rect {
+                    x: outer.x,
+                    y: line_top + shift,
+                    // Laying the box out again has to hand it a containing block it
+                    // will arrive back at the same width from, and `width: auto`
+                    // takes the box's own edges off whatever it is given — so that
+                    // is the outer width, not the content width. Passing the content
+                    // width charged every padded item for its padding twice, which
+                    // is how a centred icon ended up narrower than its own picture.
+                    width: outer.width,
+                    height: 0.0,
+                },
+                ..Default::default()
             };
             // Re-run layout so descendants move with the box.
             child.layout(slot, fonts, images);
@@ -2176,7 +2740,9 @@ enum Axis {
 /// `rows / columns`. Area strings may appear before the slash, so only the
 /// track list on each side is taken.
 fn shorthand_tracks(style: &StyledNode, axis: Axis) -> Option<String> {
-    let Some(Value::Raw(spec)) = style.value("grid-template") else { return None };
+    let Some(Value::Raw(spec)) = style.value("grid-template") else {
+        return None;
+    };
     let (rows, columns) = spec.split_once('/')?;
     let text = match axis {
         Axis::Rows => rows,
@@ -2209,7 +2775,11 @@ type Area = (usize, usize, usize);
 fn parse_grid_areas(spec: &str) -> std::collections::HashMap<String, Area> {
     let mut areas: std::collections::HashMap<String, Area> = Default::default();
     let quotes: [char; 2] = ['"', '\''];
-    for (row, line) in spec.split(quotes).filter(|s| !s.trim().is_empty()).enumerate() {
+    for (row, line) in spec
+        .split(quotes)
+        .filter(|s| !s.trim().is_empty())
+        .enumerate()
+    {
         for (col, name) in line.split_whitespace().enumerate() {
             if name == "." {
                 continue;
@@ -2235,7 +2805,11 @@ fn named_area(style: &StyledNode, areas: &std::collections::HashMap<String, Area
 /// Read `grid-column` or `grid-row` as (zero-based start, span). `track_count`
 /// bounds a valid start line — pass `usize::MAX` for `grid-row`, since rows
 /// have no fixed count the way `grid-template-columns` gives columns one.
-fn parse_grid_span(style: &StyledNode, property: &str, track_count: usize) -> (Option<usize>, usize) {
+fn parse_grid_span(
+    style: &StyledNode,
+    property: &str,
+    track_count: usize,
+) -> (Option<usize>, usize) {
     let spec = match style.value(property) {
         Some(Value::Raw(spec)) => spec,
         Some(Value::Number(n)) => return (Some((n as usize).saturating_sub(1)), 1),
@@ -2293,8 +2867,7 @@ pub fn resolve_tracks(spec: &str, available: f32, gap: f32, ctx: LengthContext) 
                         // items than columns, which needs the item count this
                         // function never receives. Covers the common case
                         // (enough items to fill every computed column).
-                        let pattern_min: f32 =
-                            pattern.iter().map(|t| track_min_size(t, ctx)).sum();
+                        let pattern_min: f32 = pattern.iter().map(|t| track_min_size(t, ctx)).sum();
                         let pattern_gap = gap * pattern.len().saturating_sub(1) as f32;
                         let span = pattern_min + pattern_gap + gap; // plus the gap before a repeat
                         if span > 0.0 {
@@ -2339,11 +2912,24 @@ pub fn resolve_tracks(spec: &str, available: f32, gap: f32, ctx: LengthContext) 
     }
 
     // Fixed tracks take their size; `fr` tracks divide the remainder.
+    //
+    // `auto` and the content keywords divide it too. They are content-sized in
+    // CSS, and this is not that — but a track whose size this function cannot
+    // work out used to come out at zero, which collapses every item in it to
+    // nothing. `grid-template-columns: 132px auto` is a card with a thumbnail
+    // and a headline, and the headline vanished.
+    //
+    // ponytail: sized as `1fr`, so `1fr auto` splits evenly where CSS would give
+    // the `auto` track only what its content needs. Doing it properly means
+    // measuring the items, which this function never sees.
     let fractions: Vec<Option<f32>> = tokens
         .iter()
-        .map(|t| {
-            t.strip_suffix("fr")
-                .and_then(|n| n.trim().parse::<f32>().ok())
+        .map(|t| match t.trim() {
+            "auto" | "min-content" | "max-content" => Some(1.0),
+            t if t.starts_with("fit-content(") => Some(1.0),
+            t => t
+                .strip_suffix("fr")
+                .and_then(|n| n.trim().parse::<f32>().ok()),
         })
         .collect();
     let fixed: Vec<f32> = tokens
@@ -2394,7 +2980,10 @@ fn find_matching_close_paren(s: &str) -> Option<usize> {
 /// `minmax(min, max)`'s max argument, which is what a track resolves to — or
 /// the token itself, unchanged, if it isn't a `minmax()`.
 fn minmax_max(token: &str) -> &str {
-    match token.strip_prefix("minmax(").and_then(|s| s.strip_suffix(')')) {
+    match token
+        .strip_prefix("minmax(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         Some(inside) => inside.rsplit(',').next().unwrap_or("").trim(),
         None => token,
     }
@@ -2462,7 +3051,11 @@ pub fn max_content_width(style: &StyledNode, fonts: Option<&FontSet>, images: &I
             };
             key.and_then(|src| images.get(&src).map(|img| img.width as f32))
                 // A picture that failed to load still reserves what it asked for.
-                .or_else(|| e.attributes.get("width").and_then(|w| w.trim().parse().ok()))
+                .or_else(|| {
+                    e.attributes
+                        .get("width")
+                        .and_then(|w| w.trim().parse().ok())
+                })
                 .unwrap_or(0.0)
         }
         NodeType::Element(_) => {
@@ -2582,9 +3175,48 @@ pub fn content_bottom(bx: &LayoutBox) -> f32 {
 
 /// Gather the painted box of every element, so the embedder can hit-test clicks.
 pub fn collect_element_rects(bx: &LayoutBox, out: &mut Vec<ElementRect>) {
+    collect_element_rects_at(bx, crate::css::Mat::IDENTITY, out);
+}
+
+/// A click has to be tested against where a box is *drawn*, so every collector
+/// below carries the `transform` its ancestors applied. Without this, clicking
+/// a transformed control misses it by however far the transform moved it —
+/// which is how a page's own rotated close button becomes unclickable.
+///
+/// ponytail: what is reported is the axis-aligned bounding box of the
+/// transformed box, so a rotated element's corners hit slightly early. Exact
+/// hit testing needs the polygon, or the inverse matrix, in [`ElementRect`] —
+/// which is a public type an embedder reads, so it is a wider change than the
+/// clicks it would sharpen.
+fn collect_element_rects_at(bx: &LayoutBox, outer: crate::css::Mat, out: &mut Vec<ElementRect>) {
+    collect_element_rects_inner(bx, outer, Cursor::Auto, out)
+}
+
+fn collect_element_rects_inner(
+    bx: &LayoutBox,
+    outer: crate::css::Mat,
+    inherited_cursor: Cursor,
+    out: &mut Vec<ElementRect>,
+) {
+    let matrix = outer.then(crate::paint::transform_matrix_of(bx));
+    // What is inherited is the *specified* value, `auto` included: each element
+    // resolves `auto` against its own content, so a link inside a paragraph is
+    // a pointer even though the paragraph resolved to an I-beam.
+    let mut specified = inherited_cursor;
     if let BoxType::BlockNode(styled) | BoxType::InlineNode(styled) = bx.box_type {
+        specified = match styled.value("cursor") {
+            Some(Value::Raw(spec)) => Cursor::parse(&spec),
+            Some(Value::Keyword(word)) => Cursor::parse(&word),
+            // `cursor` inherits, so an element that says nothing keeps whatever
+            // its ancestors asked for.
+            _ => inherited_cursor,
+        };
+        let cursor = match specified {
+            Cursor::Auto => resolve_auto_cursor(bx, styled),
+            explicit => explicit,
+        };
         if let NodeType::Element(ref e) = styled.node.node_type {
-            let b = bx.dimensions.border_box();
+            let b = crate::paint::transformed_bounds(matrix, bx.dimensions.border_box());
             out.push(ElementRect {
                 node_id: e.node_id,
                 id: e.id().cloned().unwrap_or_default(),
@@ -2592,32 +3224,216 @@ pub fn collect_element_rects(bx: &LayoutBox, out: &mut Vec<ElementRect>) {
                 y: b.y,
                 width: b.width,
                 height: b.height,
+                cursor,
             });
         }
     }
     for child in &bx.children {
-        collect_element_rects(child, out);
+        collect_element_rects_inner(child, matrix, specified, out);
+    }
+}
+
+/// What `cursor: auto` means at this box: a pointer over a link, an I-beam over
+/// text, and otherwise whatever the surrounding content resolved to.
+///
+/// This is the whole reason the cursor is worth having — it is how a page says
+/// "this is clickable" *before* the click.
+fn resolve_auto_cursor(bx: &LayoutBox, styled: &crate::style::StyledNode) -> Cursor {
+    if href_of(styled).is_some() {
+        return Cursor::Pointer;
+    }
+    if let NodeType::Element(ref e) = styled.node.node_type {
+        match e.tag_name.as_str() {
+            "button" | "select" | "summary" | "label" => return Cursor::Pointer,
+            "input" | "textarea" => return Cursor::Text,
+            _ => {}
+        }
+    }
+    // Text this box drew itself, rather than text somewhere below it — an
+    // I-beam over a whole card would be worse than none.
+    match bx.text_fragments.is_empty() {
+        false => Cursor::Text,
+        true => Cursor::Default,
+    }
+}
+
+/// Pin every `position: sticky` box the page has scrolled past.
+///
+/// Run after layout rather than during it, because what a sticky box does
+/// depends on where it ended up — and on where its parent ended up, which is
+/// only settled once the flow above it has been placed. Everything inside the
+/// box was laid out at its natural position, so pinning it moves the subtree.
+///
+/// ponytail: `top` only, and no clamp to the containing block — a sticky box
+/// stays pinned past the end of the section it belongs to, where a browser
+/// would let it scroll away with its container. `top: 0` on a page-level header
+/// is the case that matters and the one this gets right; a sticky table header
+/// inside a scrolling panel over-sticks. `bottom` needs the same treatment from
+/// the other end.
+fn apply_sticky(bx: &mut LayoutBox, scroll_top: f32) {
+    if let Some(shift) = sticky_shift(bx, scroll_top) {
+        translate_subtree(bx, shift);
+        return; // its own descendants moved with it; nothing below is sticky *and* independent
+    }
+    for child in &mut bx.children {
+        apply_sticky(child, scroll_top);
+    }
+}
+
+/// How far down a sticky box has to move to stay at its threshold, or `None`
+/// when it is not sticky or the page has not reached it yet.
+fn sticky_shift(bx: &LayoutBox, scroll_top: f32) -> Option<f32> {
+    let style = match bx.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return None,
+    };
+    match style.value("position") {
+        Some(Value::Keyword(ref k)) if k == "sticky" => {}
+        _ => return None,
+    }
+    let ctx = style.length_context(bx.dimensions.content.height);
+    let top = style.value("top")?.resolve(ctx);
+    // A sticky box never rises above where flow put it — it only ever waits
+    // there until the page catches up with it.
+    let shift = (scroll_top + top) - bx.dimensions.margin_box().y;
+    (shift > 0.0).then_some(shift)
+}
+
+/// Move a box and everything it contains down the page by `dy`.
+fn translate_subtree(bx: &mut LayoutBox, dy: f32) {
+    bx.dimensions.content.y += dy;
+    for frag in &mut bx.text_fragments {
+        frag.y += dy;
+    }
+    for link in &mut bx.link_areas {
+        link.y += dy;
+    }
+    for inline in &mut bx.inline_boxes {
+        inline.y += dy;
+    }
+    for child in &mut bx.children {
+        translate_subtree(child, dy);
+    }
+}
+
+/// Cut each overflowing line short at `limit` and mark it with an ellipsis.
+///
+/// `text-overflow` only says what to do with text that has already overflowed
+/// — the clipping itself is `overflow`'s job, at paint time. This replaces the
+/// run straddling the edge with as much of itself as fits beside a `…`, and
+/// drops whatever followed it on that line.
+///
+/// ponytail: one ellipsis per line, and only at the end (`text-overflow` can
+/// also take a string, or clip from the start in a right-to-left run). The
+/// engine has no bidi, so there is no second end to truncate from yet.
+fn apply_ellipsis(fragments: &mut Vec<TextFragment>, limit: f32, fonts: &FontSet) {
+    let mut dropped: Vec<usize> = Vec::new();
+    let mut line_start = 0;
+    while line_start < fragments.len() {
+        let y = fragments[line_start].y;
+        let line_end = fragments[line_start..]
+            .iter()
+            .position(|f| f.y != y)
+            .map_or(fragments.len(), |n| line_start + n);
+        if let Some(over) =
+            (line_start..line_end).find(|&i| fragments[i].x + fragments[i].width > limit)
+        {
+            shorten_to_fit(&mut fragments[over], limit, fonts);
+            dropped.extend(over + 1..line_end);
+        }
+        line_start = line_end;
+    }
+    for i in dropped.into_iter().rev() {
+        fragments.remove(i);
+    }
+}
+
+/// Re-shape a run as however much of itself fits before `limit`, ending in `…`.
+fn shorten_to_fit(frag: &mut TextFragment, limit: f32, fonts: &FontSet) {
+    const ELLIPSIS: char = '\u{2026}';
+    let Some(entry) = fonts.entries.get(frag.font_index) else {
+        return;
+    };
+    let room = (limit - frag.x).max(0.0);
+    // A fragment is one word, so walking back a character at a time is a
+    // handful of steps — not a search worth being clever about.
+    let mut chars: Vec<char> = frag.text.chars().collect();
+    loop {
+        let candidate: String = chars
+            .iter()
+            .copied()
+            .chain(std::iter::once(ELLIPSIS))
+            .collect();
+        let (glyphs, width) = shape_run(entry, &frag.transform.apply(&candidate), frag.size);
+        // The ellipsis alone may not fit either, and it is still what the line
+        // ends with — paint clips whatever hangs past the box.
+        if width <= room || chars.is_empty() {
+            frag.glyphs = glyphs;
+            frag.width = width;
+            frag.text = candidate;
+            return;
+        }
+        chars.pop();
     }
 }
 
 /// Gather every painted word from the laid-out tree, in document order —
 /// which is reading order, and so the order a selection runs through.
 pub fn collect_text_runs(bx: &LayoutBox, out: &mut Vec<TextRun>) {
-    out.extend(bx.text_fragments.iter().map(|f| TextRun {
-        text: f.text.clone(),
-        x: f.x,
-        y: f.y,
-        width: f.width,
-        height: f.line_height,
+    collect_text_runs_at(bx, crate::css::Mat::IDENTITY, out);
+}
+
+fn collect_text_runs_at(bx: &LayoutBox, outer: crate::css::Mat, out: &mut Vec<TextRun>) {
+    let matrix = outer.then(crate::paint::transform_matrix_of(bx));
+    out.extend(bx.text_fragments.iter().filter(|f| !f.generated).map(|f| {
+        let drawn = crate::paint::transformed_bounds(
+            matrix,
+            Rect {
+                x: f.x,
+                y: f.y,
+                width: f.width,
+                height: f.line_height,
+            },
+        );
+        TextRun {
+            text: f.text.clone(),
+            x: drawn.x,
+            y: drawn.y,
+            width: drawn.width,
+            height: drawn.height,
+        }
     }));
     for child in &bx.children {
-        collect_text_runs(child, out);
+        collect_text_runs_at(child, matrix, out);
     }
 }
 
 /// Gather every clickable link region from the laid-out tree (absolute coords).
 pub fn collect_links(bx: &LayoutBox, out: &mut Vec<LinkArea>) {
-    out.extend(bx.link_areas.iter().cloned());
+    collect_links_at(bx, crate::css::Mat::IDENTITY, out);
+}
+
+fn collect_links_at(bx: &LayoutBox, outer: crate::css::Mat, out: &mut Vec<LinkArea>) {
+    let matrix = outer.then(crate::paint::transform_matrix_of(bx));
+    let drawn = |area: &LinkArea| {
+        let b = crate::paint::transformed_bounds(
+            matrix,
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: area.height,
+            },
+        );
+        LinkArea {
+            href: area.href.clone(),
+            x: b.x,
+            y: b.y,
+            width: b.width,
+            height: b.height,
+        }
+    };
+    out.extend(bx.link_areas.iter().map(&drawn));
     // An `<a>` that is a box in its own right — `display:inline-block`, or a
     // block — never gets an inline link area: its text is laid out by an
     // anonymous child that has no idea it sits inside a link. The box itself is
@@ -2626,7 +3442,7 @@ pub fn collect_links(bx: &LayoutBox, out: &mut Vec<LinkArea>) {
     // button and did nothing.
     if let BoxType::BlockNode(styled) = bx.box_type {
         if let Some(href) = href_of(styled) {
-            let area = bx.dimensions.border_box();
+            let area = crate::paint::transformed_bounds(matrix, bx.dimensions.border_box());
             out.push(LinkArea {
                 href: href.to_string(),
                 x: area.x,
@@ -2637,7 +3453,7 @@ pub fn collect_links(bx: &LayoutBox, out: &mut Vec<LinkArea>) {
         }
     }
     for child in &bx.children {
-        collect_links(child, out);
+        collect_links_at(child, matrix, out);
     }
 }
 
@@ -2651,6 +3467,29 @@ fn line_shift(line_right: f32, content_right: f32, factor: f32) -> f32 {
     (content_right - line_right).max(0.0) * factor
 }
 
+/// Is this a percentage height against a containing block that has not decided
+/// its own height yet?
+///
+/// Per CSS 2.1 §10.5, a percentage height whose containing block's height
+/// depends on its content is *not* resolvable and computes to `auto` — the box
+/// is sized by its own content instead. Resolving it against the zero the
+/// top-down pass has at that moment collapses the box to nothing, which is what
+/// `height: 100%` on a card's link wrapper did: the wrapper vanished, the card
+/// contributed no height to its grid row, and the next row of cards printed
+/// over it.
+fn is_indefinite_percentage(value: &Value, containing_height: f32) -> bool {
+    containing_height <= 0.0 && mentions_percentage(value)
+}
+
+fn mentions_percentage(value: &Value) -> bool {
+    match value {
+        Value::Length(_, Unit::Percent) => true,
+        // `calc(100% - 32px)` is percentage-dependent too.
+        Value::Calc(expr) => expr.mentions_percentage(),
+        _ => false,
+    }
+}
+
 /// A text node holding nothing but collapsible whitespace.
 fn is_whitespace_text(style_node: &StyledNode) -> bool {
     matches!(&style_node.node.node_type, NodeType::Text(text) if text.trim().is_empty())
@@ -2659,12 +3498,41 @@ fn is_whitespace_text(style_node: &StyledNode) -> bool {
 /// Does this node have a block-level child? Inline-block does not count: it is
 /// inline-level and sits happily in a line.
 fn contains_block(style_node: &StyledNode) -> bool {
-    style_node.children.iter().any(|child| {
+    box_generating_children(style_node).iter().any(|child| {
         matches!(
             child.display(),
             Display::Block | Display::Flex | Display::Grid | Display::Table
         )
     })
+}
+
+/// The children that actually produce boxes.
+///
+/// `display: contents` makes an element generate no box of its own: its children
+/// take its place in its parent's layout. A wrapper around two grid items is
+/// exactly what it is for, and giving that wrapper a box instead makes both items
+/// children of *it* rather than of the grid — so the grid sees one item where the
+/// page put two, gives it one column, and the two stack inside it. That is what
+/// BBC News looked like: headlines a couple of words wide, and one card's text
+/// printed over the next card's picture.
+fn box_generating_children<'a>(style_node: &'a StyledNode<'a>) -> Vec<&'a StyledNode<'a>> {
+    // The common case is that nothing is skipped, and walking twice is cheaper
+    // than allocating a vector for every box on the page.
+    if !style_node
+        .children
+        .iter()
+        .any(|child| child.display() == Display::Contents)
+    {
+        return style_node.children.iter().collect();
+    }
+    let mut out = Vec::new();
+    for child in &style_node.children {
+        match child.display() {
+            Display::Contents => out.extend(box_generating_children(child)),
+            _ => out.push(child),
+        }
+    }
+    out
 }
 
 /// `force_block` blockifies a node because its parent is a flex container —
@@ -2683,6 +3551,9 @@ fn build_box<'a>(style_node: &'a StyledNode<'a>, force_block: bool) -> LayoutBox
         Display::Block | Display::Flex | Display::Grid | Display::Table => {
             BoxType::BlockNode(style_node)
         }
+        // Only reachable for the root itself: every other `display: contents`
+        // element is skipped by its parent, which takes its children instead.
+        Display::Contents => BoxType::BlockNode(style_node),
         // An inline-block lays out as a block; its parent decides where it sits.
         Display::InlineBlock => BoxType::BlockNode(style_node),
         Display::Inline if force_block => BoxType::BlockNode(style_node),
@@ -2692,14 +3563,16 @@ fn build_box<'a>(style_node: &'a StyledNode<'a>, force_block: bool) -> LayoutBox
 
     // Flex and grid items are always block-level, whatever their own display says.
     let blockifies = matches!(display, Display::Flex | Display::Grid);
-    for child in &style_node.children {
+    for child in box_generating_children(style_node) {
         // Whitespace between flex or grid items produces no box at all — the
         // newlines in a page's source must not become items of their own.
         if blockifies && is_whitespace_text(child) {
             continue;
         }
         match child.display() {
-            Display::None => {} // skip
+            // Both already dealt with: `none` generates nothing, and `contents`
+            // was replaced by its own children above.
+            Display::None | Display::Contents => {}
             Display::Block | Display::Flex | Display::Grid | Display::Table => {
                 root.children.push(build_box(child, false))
             }
@@ -2738,9 +3611,21 @@ mod tests {
     #[test]
     fn letter_spacing_pushes_each_glyph_past_the_last_and_widens_the_run() {
         let mut glyphs = vec![
-            PositionedGlyph { id: 1, x: 0.0, y: 0.0 },
-            PositionedGlyph { id: 2, x: 10.0, y: 0.0 },
-            PositionedGlyph { id: 3, x: 18.0, y: 0.0 },
+            PositionedGlyph {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+            },
+            PositionedGlyph {
+                id: 2,
+                x: 10.0,
+                y: 0.0,
+            },
+            PositionedGlyph {
+                id: 3,
+                x: 18.0,
+                y: 0.0,
+            },
         ];
         let extra = spread_glyphs(&mut glyphs, 5.0);
         assert_eq!(extra, 15.0); // 5px after each of the 3 glyphs
@@ -2749,9 +3634,61 @@ mod tests {
         assert_eq!(glyphs[2].x, 28.0); // 18 + 2*5
 
         // No spacing: nothing moves, nothing is added.
-        let mut untouched = vec![PositionedGlyph { id: 1, x: 3.0, y: 0.0 }];
+        let mut untouched = vec![PositionedGlyph {
+            id: 1,
+            x: 3.0,
+            y: 0.0,
+        }];
         assert_eq!(spread_glyphs(&mut untouched, 0.0), 0.0);
         assert_eq!(untouched[0].x, 3.0);
+    }
+
+    #[test]
+    fn text_transform_changes_what_is_drawn_and_nothing_else() {
+        // Full Unicode mappings, not the per-character ones.
+        assert_eq!(TextTransform::Uppercase.apply("stra\u{df}e"), "STRASSE");
+        assert_eq!(
+            TextTransform::Lowercase.apply("\u{3a3}\u{3bf}\u{3c6}\u{3bf}\u{3a3}"),
+            "\u{3c3}\u{3bf}\u{3c6}\u{3bf}\u{3c2}"
+        );
+        assert_eq!(
+            TextTransform::Capitalize.apply("hello wide world"),
+            "Hello Wide World"
+        );
+        assert_eq!(TextTransform::None.apply("Left Alone"), "Left Alone");
+        // Caseless scripts pass through untouched rather than being corrupted.
+        let hindi = "\u{928}\u{92e}\u{938}\u{94d}\u{924}\u{947}";
+        assert_eq!(TextTransform::Uppercase.apply(hindi), hindi);
+        assert_eq!(TextTransform::Capitalize.apply(hindi), hindi);
+
+        // The property is read off the style, and it inherits to the inline
+        // child that actually holds the text.
+        let dom =
+            crate::html::parse("<div class=nav><span>news</span></div><p>plain</p>".to_string());
+        let sheet = crate::css::parse(".nav { text-transform: uppercase; }".to_string());
+        let styled = crate::style::style_tree(&dom, &sheet);
+        fn find<'a>(
+            node: &'a crate::style::StyledNode<'a>,
+            tag: &str,
+        ) -> Option<&'a crate::style::StyledNode<'a>> {
+            if let dom::NodeType::Element(e) = &node.node.node_type {
+                if e.tag_name == tag {
+                    return Some(node);
+                }
+            }
+            node.children.iter().find_map(|c| find(c, tag))
+        }
+        let span = find(&styled, "span").expect("the span");
+        assert_eq!(
+            TextTransform::parse(span.value("text-transform")),
+            TextTransform::Uppercase,
+            "text-transform did not reach the inline child"
+        );
+        let plain = find(&styled, "p").expect("the p");
+        assert_eq!(
+            TextTransform::parse(plain.value("text-transform")),
+            TextTransform::None
+        );
     }
 
     #[test]
@@ -2763,7 +3700,7 @@ mod tests {
         assert_eq!(areas.get("article"), Some(&(1, 1, 1)));
         assert_eq!(areas.get("footer"), Some(&(2, 0, 2)));
         // A `.` cell names nothing.
-        assert!(parse_grid_areas("'. a'").get(".").is_none());
+        assert!(!parse_grid_areas("'. a'").contains_key("."));
     }
 
     #[test]
@@ -2837,10 +3774,426 @@ mod tests {
             .map(|r| {
                 (
                     r.id,
-                    Rect { x: r.x, y: r.y, width: r.width, height: r.height },
+                    Rect {
+                        x: r.x,
+                        y: r.y,
+                        width: r.width,
+                        height: r.height,
+                    },
                 )
             })
             .collect()
+    }
+
+    /// Every piece of text a box and its descendants would draw, generated
+    /// content included — which is what the *screen* shows.
+    ///
+    /// Taken before shaping: turning these into glyphs needs a real font, which
+    /// the engine never owns (the embedder supplies the bytes), and what is
+    /// being checked here is which text reaches the line at all. It mirrors what
+    /// `layout_inline_children` does, including a block's own generated content
+    /// landing on the anonymous box that holds its lines.
+    fn drawn(bx: &LayoutBox, out: &mut Vec<String>) {
+        let mut pieces = Vec::new();
+        if let Some(owner) = bx.generated_from {
+            push_generated(owner, "::before:content", 16.0, &None, &mut pieces);
+        }
+        for (i, child) in bx.children.iter().enumerate() {
+            if matches!(child.box_type, BoxType::InlineNode(_)) {
+                collect_inline_text(child, 16.0, None, &mut pieces, &[i]);
+            }
+        }
+        if let Some(owner) = bx.generated_from {
+            push_generated(owner, "::after:content", 16.0, &None, &mut pieces);
+        }
+        out.extend(pieces.iter().filter_map(|piece| match piece {
+            InlinePiece::Text(text) => Some(text.text.clone()),
+            _ => None,
+        }));
+        for child in &bx.children {
+            if !matches!(child.box_type, BoxType::InlineNode(_)) {
+                drawn(child, out);
+            }
+        }
+    }
+
+    #[test]
+    fn content_concatenates_its_components() {
+        let dom = crate::html::parse("<main><h2 id=h>Title</h2></main>".to_string());
+        let sheet = crate::css::parse(
+            "h2::before { content: \"Figure \" counter(fig) \": \"; } \
+             h2 { counter-increment: fig; display: block; } \
+             main { display: block; }"
+                .to_string(),
+        );
+        let styled = crate::style::style_tree(&dom, &sheet);
+        fn find<'a>(
+            node: &'a crate::style::StyledNode<'a>,
+            tag: &str,
+        ) -> Option<&'a crate::style::StyledNode<'a>> {
+            if let dom::NodeType::Element(e) = &node.node.node_type {
+                if e.tag_name == tag {
+                    return Some(node);
+                }
+            }
+            node.children.iter().find_map(|c| find(c, tag))
+        }
+        let heading = find(&styled, "h2").expect("the heading");
+        let raw = match heading.value("::before:content") {
+            Some(Value::Raw(raw)) => raw,
+            other => panic!("no generated content: {other:?}"),
+        };
+        // The style walk has already turned the counter into a string.
+        assert_eq!(content_text(&raw, heading), "Figure 1: ");
+
+        // `attr()` reads the element it is on — printing a link's target is the
+        // classic use, and print stylesheets are full of it.
+        let dom = crate::html::parse("<a id=l href=\"/docs\">docs</a>".to_string());
+        let sheet = crate::css::parse("a::after { content: \" (\" attr(href) \")\"; }".to_string());
+        let styled = crate::style::style_tree(&dom, &sheet);
+        let link = find(&styled, "a").expect("the link");
+        let raw = match link.value("::after:content") {
+            Some(Value::Raw(raw)) => raw,
+            other => panic!("no generated content: {other:?}"),
+        };
+        assert_eq!(content_text(&raw, link), " (/docs)");
+
+        // The quote keywords honour `quotes`, and fall back to typographic
+        // double quotes when the page says nothing.
+        let dom = crate::html::parse("<q id=q>hi</q>".to_string());
+        let sheet = crate::css::parse(
+            "q::before { content: open-quote; } q { quotes: \"\\00AB\" \"\\00BB\"; }".to_string(),
+        );
+        let styled = crate::style::style_tree(&dom, &sheet);
+        let quoted = find(&styled, "q").expect("the q");
+        let raw = match quoted.value("::before:content") {
+            Some(Value::Raw(raw)) => raw,
+            other => panic!("no generated content: {other:?}"),
+        };
+        assert_eq!(content_text(&raw, quoted), "\u{ab}");
+        // `none` generates nothing at all.
+        assert_eq!(content_text("none", quoted), "");
+        assert_eq!(content_text("normal", quoted), "");
+    }
+
+    #[test]
+    fn nested_counters_number_themselves() {
+        let css = "main, section, h2, h3 { display: block; } \
+                   main { counter-reset: chapter; } \
+                   h2 { counter-increment: chapter; counter-reset: part; } \
+                   h3 { counter-increment: part; } \
+                   h2::before { content: counter(chapter) \". \"; } \
+                   h3::before { content: counters(part, \".\") \" \"; }";
+        let html = "<main><h2>One</h2><h3>a</h3><h3>b</h3>\
+                    <h2>Two</h2><h3>c</h3></main>";
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = crate::style::style_tree(&dom, &sheet);
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 800.0;
+        let root = layout_tree(&styled, viewport, None, &ImageMap::new());
+        let mut painted = Vec::new();
+        drawn(&root, &mut painted);
+        let numbered: Vec<String> = painted.iter().map(|t| t.trim().to_string()).collect();
+        let joined = numbered.join("|");
+        // The counter a sibling reset makes is still in scope for the siblings
+        // after it — which is the whole reason `h2` + `h3` numbering works. Each
+        // `h3` is `counters(part, ".")`, and `part` restarts inside each `h2`, so
+        // the last one is `1` again rather than carrying on or nesting.
+        assert_eq!(
+            joined, "1.|One|1|a|2|b|2.|Two|1|c",
+            "counters did not number the page as written"
+        );
+    }
+
+    #[test]
+    fn generated_content_is_not_selectable_or_findable() {
+        let css = "li { display: block; } li::before { content: \"\\2022  \"; }";
+        let html = "<ul><li>first</li><li>second</li></ul>";
+        // On screen the bullets are there...
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = crate::style::style_tree(&dom, &sheet);
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 800.0;
+        let root = layout_tree(&styled, viewport, None, &ImageMap::new());
+        let mut painted = Vec::new();
+        drawn(&root, &mut painted);
+        assert!(
+            painted.iter().any(|t| t.contains('\u{2022}')),
+            "the bullet was not drawn at all"
+        );
+        // ...and each run knows whether it came from the document or from CSS,
+        // which is what selection and find-in-page filter on.
+        fn gather(bx: &LayoutBox, out: &mut Vec<(String, bool)>) {
+            let mut pieces = Vec::new();
+            if let Some(owner) = bx.generated_from {
+                push_generated(owner, "::before:content", 16.0, &None, &mut pieces);
+            }
+            for (i, child) in bx.children.iter().enumerate() {
+                if matches!(child.box_type, BoxType::InlineNode(_)) {
+                    collect_inline_text(child, 16.0, None, &mut pieces, &[i]);
+                }
+            }
+            out.extend(pieces.iter().filter_map(|p| match p {
+                InlinePiece::Text(t) => Some((t.text.clone(), t.generated)),
+                _ => None,
+            }));
+            for child in &bx.children {
+                if !matches!(child.box_type, BoxType::InlineNode(_)) {
+                    gather(child, out);
+                }
+            }
+        }
+        let mut pieces = Vec::new();
+        gather(&root, &mut pieces);
+        let selectable: Vec<&String> = pieces
+            .iter()
+            .filter(|(_, generated)| !generated)
+            .map(|(text, _)| text)
+            .collect();
+        assert_eq!(selectable, vec!["first", "second"]);
+        assert!(
+            pieces
+                .iter()
+                .any(|(text, generated)| *generated && text.contains('\u{2022}')),
+            "the bullet was not marked as generated, so it would be selectable"
+        );
+    }
+
+    #[test]
+    fn the_cursor_parses_inherits_and_resolves_auto() {
+        // The keyword list, and the `url()` grammar, which falls back to the
+        // keyword that must follow it.
+        assert_eq!(Cursor::parse("pointer"), Cursor::Pointer);
+        assert_eq!(Cursor::parse("col-resize"), Cursor::ColResize);
+        assert_eq!(Cursor::parse("not-allowed"), Cursor::NotAllowed);
+        assert_eq!(Cursor::parse("url(hand.png), pointer"), Cursor::Pointer);
+        assert_eq!(Cursor::parse("url(hand.png) 4 4, grab"), Cursor::Grab);
+        // A keyword this engine has no cursor for is `auto`, not a guess.
+        assert_eq!(Cursor::parse("vertical-text"), Cursor::Auto);
+        // The wire's numbering survives a round trip.
+        for cursor in [Cursor::Auto, Cursor::Pointer, Cursor::ZoomOut, Cursor::None] {
+            assert_eq!(Cursor::from_code(cursor.code()), cursor);
+        }
+
+        let css = "div, main { display: block; }
+                   #grabbable { cursor: grab; width: 100px; height: 20px; }
+                   #inside { width: 50px; height: 10px; }
+                   #plain { width: 100px; height: 20px; }";
+        let html = "<main><div id=grabbable><div id=inside></div></div>\
+                    <div id=plain></div><a id=link href=/x>go</a>\
+                    <button id=go>press</button></main>";
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = crate::style::style_tree(&dom, &sheet);
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 400.0;
+        let root = layout_tree(&styled, viewport, None, &ImageMap::new());
+        let mut rects = Vec::new();
+        collect_element_rects(&root, &mut rects);
+        let cursor_of = |id: &str| {
+            rects
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("no rect for {id}"))
+                .cursor
+        };
+
+        assert_eq!(cursor_of("grabbable"), Cursor::Grab);
+        // It inherits: the child said nothing and is still grabbable.
+        assert_eq!(cursor_of("inside"), Cursor::Grab);
+        // `auto` elsewhere is the plain arrow.
+        assert_eq!(cursor_of("plain"), Cursor::Default);
+        // `auto` over a link is a pointer, and over a button too — that is the
+        // whole point of the property: it says "clickable" before the click.
+        assert_eq!(cursor_of("link"), Cursor::Pointer);
+        assert_eq!(cursor_of("go"), Cursor::Pointer);
+    }
+
+    #[test]
+    fn a_rotated_box_is_hit_where_it_is_drawn() {
+        // A 100x20 box at the origin, turned a quarter turn about its centre:
+        // it ends up 20 wide and 100 tall, still centred on (50, 10).
+        let css = "div { display: block; }
+                   #badge { width: 100px; height: 20px;
+                            transform: rotate(90deg); }";
+        let b = boxes_by_id("<main><div id=badge></div></main>", css, 400.0);
+        let badge = b["badge"];
+        assert_eq!(
+            badge.width.round(),
+            20.0,
+            "the rotation did not reach hit testing"
+        );
+        assert_eq!(badge.height.round(), 100.0);
+        assert_eq!(badge.x.round(), 40.0);
+        assert_eq!(badge.y.round(), -40.0);
+
+        // `transform-origin` moves the pivot, and that has to move the hit box
+        // with it: about the top-left corner the same box sweeps down-right.
+        let css = "div { display: block; }
+                   #badge { width: 100px; height: 20px;
+                            transform: rotate(90deg); transform-origin: left top; }";
+        let b = boxes_by_id("<main><div id=badge></div></main>", css, 400.0);
+        let badge = b["badge"];
+        assert_eq!(badge.x.round(), -20.0);
+        assert_eq!(badge.y.round(), 0.0);
+
+        // A plain translate, which needs no buffer, moves the hit box too — it
+        // did not before, so a translated control could not be clicked.
+        let css = "div { display: block; }
+                   #badge { width: 100px; height: 20px; transform: translate(30px, 5px); }";
+        let b = boxes_by_id("<main><div id=badge></div></main>", css, 400.0);
+        assert_eq!(b["badge"].x.round(), 30.0);
+        assert_eq!(b["badge"].y.round(), 5.0);
+    }
+
+    /// The three defects behind bbc.com/news: cards in one narrow column,
+    /// stacked on top of one another. Each is its own rule, and each was enough
+    /// on its own to make the page unreadable.
+    #[test]
+    fn a_wrapper_with_display_contents_leaves_its_children_in_the_grid() {
+        let css = "div { display: block; }
+                   #grid { display: grid; grid-template-columns: repeat(24, 1fr); }
+                   #wrap { display: contents; }
+                   #a { grid-column: 1/span 8; height: 40px; }
+                   #b { grid-column: 9/span 16; height: 40px; }";
+        let html = "<main id=grid><div id=wrap><div id=a></div><div id=b></div></div></main>";
+        let b = boxes_by_id(html, css, 800.0);
+        // The wrapper generates no box, so its children are the grid's items and
+        // take the columns they asked for. With a box in the way they were both
+        // children of *it*, the grid saw one item, gave it one column of
+        // twenty-four, and they stacked inside 33 pixels.
+        assert_eq!(
+            b["a"].width.round(),
+            267.0,
+            "the first item did not get its columns"
+        );
+        assert_eq!(b["b"].width.round(), 533.0);
+        assert_eq!(b["a"].x, 0.0);
+        assert_eq!(b["b"].x.round(), 267.0);
+        assert_eq!(
+            b["a"].y, b["b"].y,
+            "the two items stacked instead of sharing a row"
+        );
+    }
+
+    #[test]
+    fn an_auto_track_takes_room_rather_than_none() {
+        let css = "div { display: block; }
+                   #grid { display: grid; grid-template-columns: 132px auto; }
+                   #thumb { height: 20px; }
+                   #text { height: 20px; }";
+        let html = "<main id=grid><div id=thumb></div><div id=text></div></main>";
+        let b = boxes_by_id(html, css, 500.0);
+        assert_eq!(b["thumb"].width, 132.0);
+        // The `auto` track used to resolve to zero, which collapsed everything in
+        // it — a card's headline beside its thumbnail simply vanished.
+        assert_eq!(b["text"].width.round(), 368.0);
+        assert_eq!(b["text"].x, 132.0);
+    }
+
+    #[test]
+    fn an_absolutely_positioned_box_takes_no_room_on_a_line() {
+        // The lazy-loading idiom: a placeholder positioned behind the real
+        // picture, both inline. The line used to make room for both — so the
+        // media block came out twice as tall and pushed the card's text onto the
+        // picture below it.
+        let css = "div { display: block; }
+                   #media { position: relative; }
+                   #under { position: absolute; display: inline-block; width: 40px; height: 60px; }
+                   #over { display: inline-block; width: 40px; height: 60px; }";
+        let html = "<main><div id=media><div id=under></div><div id=over></div></div></main>";
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = crate::style::style_tree(&dom, &sheet);
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 400.0;
+        let root = layout_tree(&styled, viewport, None, &ImageMap::new());
+
+        // Which boxes the line would place. Shaping needs a real font, which the
+        // engine never owns, so what is checked is what reaches the line — and
+        // the out-of-flow box must not.
+        fn line_items(bx: &LayoutBox, out: &mut Vec<String>) {
+            let mut pieces = Vec::new();
+            for (i, child) in bx.children.iter().enumerate() {
+                if child.is_out_of_flow() {
+                    continue;
+                }
+                if matches!(child.box_type, BoxType::BlockNode(_)) {
+                    pieces.push(InlinePiece::Atomic(vec![i]));
+                } else {
+                    collect_inline_text(child, 16.0, None, &mut pieces, &[i]);
+                }
+            }
+            for piece in &pieces {
+                if let InlinePiece::Atomic(path) = piece {
+                    let mut at = bx;
+                    for step in path {
+                        at = &at.children[*step];
+                    }
+                    if let BoxType::BlockNode(s) | BoxType::InlineNode(s) = at.box_type {
+                        if let dom::NodeType::Element(e) = &s.node.node_type {
+                            out.push(e.id().cloned().unwrap_or_default());
+                        }
+                    }
+                }
+            }
+        }
+        /// The box with this `id`, wherever it sits.
+        fn find_by_id<'b, 'a>(bx: &'b LayoutBox<'a>, id: &str) -> Option<&'b LayoutBox<'a>> {
+            if let BoxType::BlockNode(s) | BoxType::InlineNode(s) = bx.box_type {
+                if let dom::NodeType::Element(e) = &s.node.node_type {
+                    if e.id().map(String::as_str) == Some(id) {
+                        return Some(bx);
+                    }
+                }
+            }
+            bx.children.iter().find_map(|c| find_by_id(c, id))
+        }
+        let media = find_by_id(&root, "media").expect("the media box");
+        let mut items = Vec::new();
+        line_items(media, &mut items);
+        assert_eq!(
+            items,
+            vec!["over".to_string()],
+            "the absolutely positioned placeholder took room on the line"
+        );
+    }
+
+    #[test]
+    fn a_percentage_height_against_an_auto_parent_is_content_sized() {
+        // `height: 100%` inside a box whose own height comes from its content is
+        // not resolvable, and per CSS computes to `auto`. Resolving it against
+        // the nothing the layout pass has at that moment collapsed the wrapper,
+        // so the card contributed no height and the next one printed over it.
+        let css = "div { display: block; }
+                   #card { display: grid; grid-template-columns: 1fr; }
+                   #link { height: 100%; }
+                   #text { height: 80px; }
+                   #next { height: 10px; }";
+        let html = "<main><div id=card><div id=link><div id=text></div></div></div>\
+                    <div id=next></div></main>";
+        let b = boxes_by_id(html, css, 400.0);
+        assert_eq!(b["link"].height, 80.0, "the wrapper collapsed to nothing");
+        assert_eq!(b["card"].height, 80.0);
+        assert_eq!(b["next"].y, 80.0, "the next card overlapped this one");
+
+        // A `calc()` that mentions a percentage is just as unresolvable.
+        let css = "div { display: block; }
+                   #link { height: calc(100% - 8px); }
+                   #text { height: 80px; }";
+        let b = boxes_by_id(
+            "<main><div id=link><div id=text></div></div></main>",
+            css,
+            400.0,
+        );
+        assert_eq!(b["link"].height, 80.0);
+
+        // An absolute height is unaffected.
+        let css = "div { display: block; } #fixed { height: 24px; }";
+        let b = boxes_by_id("<main><div id=fixed></div></main>", css, 400.0);
+        assert_eq!(b["fixed"].height, 24.0);
     }
 
     #[test]
@@ -3134,9 +4487,16 @@ mod tests {
             let mut v = HashMap::new();
             v.insert("display".to_string(), Value::Keyword("block".into()));
             v.insert("height".to_string(), Value::Length(height, Unit::Px));
-            v.insert("grid-column".to_string(), Value::Raw(grid_column.to_string()));
+            v.insert(
+                "grid-column".to_string(),
+                Value::Raw(grid_column.to_string()),
+            );
             v.insert("grid-row".to_string(), Value::Raw(grid_row.to_string()));
-            StyledNode { node: &node, specified_values: v, children: vec![] }
+            StyledNode {
+                node: &node,
+                specified_values: v,
+                children: vec![],
+            }
         };
         let mut values = HashMap::new();
         values.insert("display".to_string(), Value::Keyword("grid".into()));
@@ -3157,14 +4517,29 @@ mod tests {
         viewport.content.width = 200.0; // 2 columns of 100
 
         let laid = layout_tree(&root, viewport, None, &ImageMap::new());
-        let xs: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.x).collect();
-        let ys: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.y).collect();
-        let heights: Vec<f32> =
-            laid.children.iter().map(|c| c.dimensions.content.height).collect();
+        let xs: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.x)
+            .collect();
+        let ys: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.y)
+            .collect();
+        let heights: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.height)
+            .collect();
 
         // `grid-row` pins the explicit items to their own row/column.
         assert_eq!(xs, vec![0.0, 100.0, 100.0]);
-        assert_eq!(ys, vec![0.0, 0.0, 40.0], "row 1 starts where row 0 (sized by item 1) ends");
+        assert_eq!(
+            ys,
+            vec![0.0, 0.0, 40.0],
+            "row 1 starts where row 0 (sized by item 1) ends"
+        );
         // The spanning item keeps its own requested height, which is taller
         // than the two rows it covers (40 + 40 = 80) — the extra 50px grows
         // the last row it spans, the way a table's rowspan cell does.
@@ -3207,17 +4582,109 @@ mod tests {
     }
 
     #[test]
+    fn generated_content_loses_its_quotes_and_resolves_its_escapes() {
+        // A sheet writes a character it cannot type as `\201C`, which is how
+        // nearly every quote mark, bullet and arrow on the web is spelled.
+        assert_eq!(unquote_content("'\\2022  '"), "\u{2022}  ");
+        assert_eq!(unquote_content("\"\\201C\""), "\u{201C}");
+        assert_eq!(unquote_content("' \\25B8'"), " \u{25B8}");
+        assert_eq!(unquote_content("\"plain text\""), "plain text");
+        // An escape runs to at most six hex digits, so text may follow it.
+        assert_eq!(unquote_content("'\\2022 x'"), "\u{2022} x");
+        // Nothing to generate: an empty string, and anything not a string at
+        // all (`attr(href)`, `counter(n)`, `none`) which this cannot resolve.
+        assert_eq!(unquote_content("''"), "");
+        assert_eq!(unquote_content("attr(href)"), "");
+        assert_eq!(unquote_content("none"), "");
+    }
+
+    #[test]
+    fn an_ellipsis_cuts_each_overflowing_line_and_leaves_the_rest_alone() {
+        // Only the bookkeeping is checked here — which run straddles the edge,
+        // and what is dropped after it. Re-shaping that run to end in `…` needs
+        // a real font, which the engine never owns (the embedder supplies the
+        // bytes), so an empty set leaves each surviving run's text as it was.
+        let fonts = FontSet {
+            entries: Vec::new(),
+        };
+        let run = |x: f32, y: f32, text: &str| TextFragment {
+            glyphs: Vec::new(),
+            text: text.to_string(),
+            width: 40.0,
+            x,
+            y,
+            size: 16.0,
+            line_height: 20.0,
+            color: Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+            underline: false,
+            strikethrough: false,
+            bold: false,
+            italic: false,
+            font_index: 0,
+            transform: TextTransform::None,
+            shadows: std::rc::Rc::new(Vec::new()),
+            generated: false,
+        };
+
+        // Two lines of three runs each, in a box 100 wide. On each line the
+        // third run starts at 90 and so runs past the edge.
+        let mut fragments = vec![
+            run(0.0, 0.0, "one"),
+            run(45.0, 0.0, "two"),
+            run(90.0, 0.0, "three"),
+            run(0.0, 20.0, "four"),
+            run(45.0, 20.0, "five"),
+            run(90.0, 20.0, "six"),
+        ];
+        apply_ellipsis(&mut fragments, 100.0, &fonts);
+
+        let kept: Vec<&str> = fragments.iter().map(|f| f.text.as_str()).collect();
+        // The straddling run stays (shortened, given a font); everything after
+        // it on that line goes — and the *next* line is judged on its own.
+        assert_eq!(kept, ["one", "two", "three", "four", "five", "six"]);
+
+        // A fourth run past the edge on the first line is dropped outright.
+        let mut spilling = vec![
+            run(0.0, 0.0, "one"),
+            run(90.0, 0.0, "two"),
+            run(140.0, 0.0, "three"),
+            run(0.0, 20.0, "next line"),
+        ];
+        apply_ellipsis(&mut spilling, 100.0, &fonts);
+        let kept: Vec<&str> = spilling.iter().map(|f| f.text.as_str()).collect();
+        assert_eq!(kept, ["one", "two", "next line"]);
+
+        // Nothing overflows: nothing is touched.
+        let mut fits = vec![run(0.0, 0.0, "one"), run(45.0, 0.0, "two")];
+        apply_ellipsis(&mut fits, 200.0, &fonts);
+        assert_eq!(fits.len(), 2);
+    }
+
+    #[test]
     fn a_percentage_width_on_a_picture_measures_its_box_and_takes_the_height_with_it() {
         // `width: 100%` used to resolve against a base of zero, so it was
         // discarded and the file's own pixel size took over — a 1536px press
         // photo then covered whatever column it was supposed to sit in. And a
         // scaled width with the original height is a picture stretched down
         // over the text beneath it, so the ratio has to come along.
-        let node = dom::elem("img".into(), HashMap::from([("src".into(), "pic".into())]), vec![]);
+        let node = dom::elem(
+            "img".into(),
+            HashMap::from([("src".into(), "pic".into())]),
+            vec![],
+        );
         let mut values = HashMap::new();
         values.insert("display".to_string(), Value::Keyword("block".into()));
         values.insert("width".to_string(), Value::Length(50.0, Unit::Percent));
-        let img = StyledNode { node: &node, specified_values: values, children: vec![] };
+        let img = StyledNode {
+            node: &node,
+            specified_values: values,
+            children: vec![],
+        };
 
         let root_node = dom::elem("div".into(), HashMap::new(), vec![]);
         let mut root_values = HashMap::new();
@@ -3233,7 +4700,11 @@ mod tests {
         let mut images = ImageMap::new();
         images.insert(
             "pic".to_string(),
-            crate::resource::DecodedImage { width: 40, height: 20, pixels: vec![] },
+            crate::resource::DecodedImage {
+                width: 40,
+                height: 20,
+                pixels: vec![],
+            },
         );
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 200.0;
@@ -3429,7 +4900,11 @@ mod tests {
         let sized = laid.children.last().expect("two items");
         assert_eq!(sized.dimensions.content.width, 200.0);
         // ...and it sits where the text leaves it, not pushed off the end.
-        assert!(sized.dimensions.content.x <= 200.0, "at x={}", sized.dimensions.content.x);
+        assert!(
+            sized.dimensions.content.x <= 200.0,
+            "at x={}",
+            sized.dimensions.content.x
+        );
     }
 
     #[test]
@@ -3442,7 +4917,11 @@ mod tests {
             if let Some(s) = shrink {
                 v.insert("flex-shrink".to_string(), Value::Number(s));
             }
-            StyledNode { node: &node, specified_values: v, children: vec![] }
+            StyledNode {
+                node: &node,
+                specified_values: v,
+                children: vec![],
+            }
         };
         let mut values = HashMap::new();
         values.insert("display".to_string(), Value::Keyword("flex".into()));
@@ -3456,9 +4935,16 @@ mod tests {
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 700.0;
         let laid = layout_tree(&root, viewport, None, &ImageMap::new());
-        let widths: Vec<f32> =
-            laid.children.iter().map(|c| c.dimensions.content.width).collect();
-        assert_eq!(widths, vec![300.0, 400.0], "only the shrinkable item gives up space");
+        let widths: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.width)
+            .collect();
+        assert_eq!(
+            widths,
+            vec![300.0, 400.0],
+            "only the shrinkable item gives up space"
+        );
 
         // With both items shrinkable (default flex-shrink: 1), the overflow
         // splits by base-size weight: 600 gives up 600/1000 of it, 400 gives
@@ -3469,8 +4955,11 @@ mod tests {
             children: vec![item(600.0, None), item(400.0, None)],
         };
         let laid_both = layout_tree(&root_both, viewport, None, &ImageMap::new());
-        let widths_both: Vec<f32> =
-            laid_both.children.iter().map(|c| c.dimensions.content.width).collect();
+        let widths_both: Vec<f32> = laid_both
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.width)
+            .collect();
         assert_eq!(widths_both, vec![420.0, 280.0]);
     }
 
@@ -3481,10 +4970,18 @@ mod tests {
         item_values.insert("display".to_string(), Value::Keyword("block".into()));
         item_values.insert("width".to_string(), Value::Length(100.0, Unit::Px));
         item_values.insert("flex-basis".to_string(), Value::Length(250.0, Unit::Px));
-        let item = StyledNode { node: &node, specified_values: item_values, children: vec![] };
+        let item = StyledNode {
+            node: &node,
+            specified_values: item_values,
+            children: vec![],
+        };
         let mut values = HashMap::new();
         values.insert("display".to_string(), Value::Keyword("flex".into()));
-        let root = StyledNode { node: &node, specified_values: values, children: vec![item] };
+        let root = StyledNode {
+            node: &node,
+            specified_values: values,
+            children: vec![item],
+        };
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 900.0;
         let laid = layout_tree(&root, viewport, None, &ImageMap::new());
@@ -3502,26 +4999,33 @@ mod tests {
             if let Some(a) = align_self {
                 v.insert("align-self".to_string(), Value::Keyword(a.into()));
             }
-            StyledNode { node: &node, specified_values: v, children: vec![] }
+            StyledNode {
+                node: &node,
+                specified_values: v,
+                children: vec![],
+            }
         };
         let mut values = HashMap::new();
         values.insert("display".to_string(), Value::Keyword("flex".into()));
-        values.insert("align-items".to_string(), Value::Keyword("flex-start".into()));
+        values.insert(
+            "align-items".to_string(),
+            Value::Keyword("flex-start".into()),
+        );
         // A 100px-tall sibling makes the line tall enough for alignment to move things.
         let root = StyledNode {
             node: &node,
             specified_values: values,
-            children: vec![
-                item(None),
-                item(Some("flex-end")),
-                {
-                    let mut v = HashMap::new();
-                    v.insert("display".to_string(), Value::Keyword("block".into()));
-                    v.insert("width".to_string(), Value::Length(20.0, Unit::Px));
-                    v.insert("height".to_string(), Value::Length(100.0, Unit::Px));
-                    StyledNode { node: &node, specified_values: v, children: vec![] }
-                },
-            ],
+            children: vec![item(None), item(Some("flex-end")), {
+                let mut v = HashMap::new();
+                v.insert("display".to_string(), Value::Keyword("block".into()));
+                v.insert("width".to_string(), Value::Length(20.0, Unit::Px));
+                v.insert("height".to_string(), Value::Length(100.0, Unit::Px));
+                StyledNode {
+                    node: &node,
+                    specified_values: v,
+                    children: vec![],
+                }
+            }],
         };
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 900.0;

@@ -29,6 +29,9 @@ const HINDI: &[(&str, &str)] = &[
     ("to reset", "पुनः सेट करने के लिए"),
     // Menu
     ("Reopen closed tab", "बंद टैब फिर खोलें"),
+    ("New private session", "नया निजी सत्र"),
+    ("Leave private session", "निजी सत्र छोड़ें"),
+    ("Private", "निजी"),
     ("Pin this tab", "इस टैब को पिन करें"),
     ("Unpin this tab", "इस टैब को अनपिन करें"),
     ("Zoom", "ज़ूम"),
@@ -41,6 +44,22 @@ const HINDI: &[(&str, &str)] = &[
     ("History", "इतिहास"),
     ("Downloads", "डाउनलोड"),
     ("Settings", "सेटिंग्स"),
+    ("Duplicate tab", "टैब की प्रति बनाएँ"),
+    ("Full screen", "पूर्ण स्क्रीन"),
+    ("Copy link", "लिंक कॉपी करें"),
+    // Right-click menus
+    ("New tab below", "नीचे नया टैब"),
+    ("New tab to the right", "दाईं ओर नया टैब"),
+    ("Close tab", "टैब बंद करें"),
+    ("Close other tabs", "बाकी टैब बंद करें"),
+    ("Close tabs below", "नीचे के टैब बंद करें"),
+    ("Close tabs to the right", "दाईं ओर के टैब बंद करें"),
+    ("Open link in new tab", "लिंक नए टैब में खोलें"),
+    ("Copy link address", "लिंक का पता कॉपी करें"),
+    ("Copy", "कॉपी करें"),
+    ("Search the web for", "वेब पर खोजें"),
+    ("Select all", "सब चुनें"),
+    ("Clear history", "इतिहास मिटाएँ"),
     // Built-in pages
     ("Assistant", "सहायक"),
     ("Unknown page", "अज्ञात पृष्ठ"),
@@ -173,7 +192,10 @@ mod tests {
 
     #[test]
     fn strings_translate_and_fall_back() {
-        settings::preview(Settings { language: 1, ..Settings::default() });
+        settings::preview(Settings {
+            language: 1,
+            ..Settings::default()
+        });
         assert_eq!(t("New tab"), "नया टैब");
         // Anything not in the table shows in English rather than blank.
         assert_eq!(t("Frobnicate"), "Frobnicate");
@@ -189,7 +211,10 @@ mod tests {
     /// translation path — a `·` in the wrong place would swallow the shortcut.
     #[test]
     fn no_label_loses_its_shortcut() {
-        settings::preview(Settings { language: 1, ..Settings::default() });
+        settings::preview(Settings {
+            language: 1,
+            ..Settings::default()
+        });
         for (_, tip) in crate::app::TIPS {
             let out = t_tip(tip);
             if let Some((_, key)) = tip.split_once("  ·  ") {
